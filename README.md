@@ -15,74 +15,90 @@
 - Export the DNS names found in certificates to a file
 - Exports certificates as individual PEM files, standalone bundles, or full bundles including trusted root CAs
 - Automatically fetches and includes Mozilla's CA bundle for comprehensive trust verification
-- Windows support: integration with the Windows system certificate store to include trusted roots
+- Exports system-trusted certificate authorities from both macOS and Windows stores for root CA inclusion
 - Protocol guessing based on common ports if not explicitly specified
 - Minimal external dependencies — built with Go for cross-platform usage
 
 ## Installation
 
-```
-go install github.com/lesydimitri/sniffl@latest
+### Option 1: Download a Precompiled Binary
+
+Go to the [releases page](https://github.com/lesydimitri/sniffl/releases) and download a precompiled binary for your operating system and architecture.
+
+### Option 2: Build from Source
+
+Clone the repository and build the binary with Go:
+
+```bash
+git clone https://github.com/lesydimitri/sniffl.git
+cd sniffl
+go build
 ```
 
-*Note:* To build or install on non-Windows platforms, use `go build` or `go install` inside the repository directory. For Windows cross-compilation on other platforms, use:
+*Note:* For Windows cross-compilation on other platforms, use:
 
-```
+```bash
 GOOS=windows GOARCH=amd64 go build
 ```
 
 ## Usage
 
-```
-sniffl [--export=single|bundle|full_bundle] (-H host:port | -F filename) [protocol]
+```bash
+sniffl [--export=single|bundle|full_bundle] (-H host:port | -F filename) [protocol] [--exportdns=FILE] [--verbose]
 ```
 
-### Options:
+## Options
 
 - `--export`  
-  Export mode:  
-  - `single`      Export each certificate as a separate PEM file  
-  - `bundle`      Export all certificates into a single PEM file  
-  - `full_bundle` Export with trusted root CAs appended  
+  Export certificates:  
+  - `single`      Export each certificate as a separate PEM file  
+  - `bundle`      Export all certificates into a single PEM file  
+  - `full_bundle` Export all certificates into a single PEM file with system/Mozilla root CAs appended  
 
-- `-H`  
-  Target hostname and port (e.g., `smtp.example.com:587`)  
+- `--exportdns FILE`  
+  Write all unique DNS names found in the scanned certificates to the specified file
 
-- `-F`  
-  File with list of targets, one per line:  
+- `--verbose`, `-v`  
+  Enable verbose debug logging
+
+- `-H host:port`  
+  Scan a single host and port (e.g. `smtp.example.com:587`)  
+
+- `-F filename`  
+  Scan multiple targets from a file. Each line must be formatted as:  
   ```
   host:port [protocol]
   ```
-  Protocols are optional per line when using `-F`
 
-- `protocol` (optional)  
-  STARTTLS protocol to use (smtp, imap, pop3, none). Only valid with `-H`
+- `protocol` (optional with `-H`, ignored with `-F`)  
+  Protocol for STARTTLS negotiation (`smtp`, `imap`, `pop3`, `none`)  
+  If omitted, the tool will try to guess based on the port (e.g., port 587 → SMTP)
 
 ## Examples
 
-Fetch and display certificates from an SMTP server and export each cert as separate files:
+Scan a single SMTP server and export each certificate separately:
 
-```
+```bash
 sniffl --export=single -H smtp.gmail.com:587 smtp
 ```
 
-Fetch certificates from multiple servers listed in a file:
+Scan using an IMAP connection and output the full bundle with roots:
 
-```
-sniffl -F targets.txt
-```
-
-Fetch certificates with full CA bundle appended:
-
-```
+```bash
 sniffl --export=full_bundle -H imap.mail.yahoo.com:143 imap
 ```
 
-## Notes
+Scan a list of targets from a file (with optional per-line protocols):
 
-- Exactly one of `-H` or `-F` must be specified.
-- If no protocol is specified, the tool guesses based on the port number.
-- The built-in CA bundle is fetched from [curl.se](https://curl.se/ca/cacert.pem) each time unless manually cached.
+```bash
+sniffl -F targets.txt
+```
+
+Export all DNS names found to a separate file:
+
+```bash
+sniffl --exportdns=dnsnames.txt -H example.com:443
+```
 
 ## Contributing
 
