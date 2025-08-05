@@ -2,14 +2,13 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/lesydimitri/sniffl.svg)](https://pkg.go.dev/github.com/lesydimitri/sniffl)
 
-**sniffl** is a lightweight, powerful **Certificate Sniffing & Export Tool** designed to fetch, inspect, and export TLS certificates from remote servers using multiple protocols including SMTP, IMAP, POP3, or plain TLS connection.
-
----
+**sniffl** is a **Certificate Sniffing & Export Tool** designed to fetch, inspect, and export TLS certificates from remote servers using multiple protocols including SMTP, IMAP, POP3, or plain TLS connection.
 
 ## Features
 
 - Supports multiple protocols with STARTTLS: SMTP, IMAP, POP3, and plain TLS
 - Fetches full certificate chains from remote servers
+- Export the DNS names found in certificates to a file
 - Exports certificates as individual PEM files, standalone bundles, or full bundles including trusted root CAs
 - Automatically fetches and includes Mozilla's CA bundle for comprehensive trust verification
 - Windows support: integration with the Windows system certificate store to include trusted roots
@@ -86,3 +85,8 @@ sniffl --export=full_bundle -H imap.mail.yahoo.com:143 imap
 ## Contributing
 
 Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/lesydimitri/sniffl/issues) or open a pull request.
+
+## Credits
+
+- Brank, for [the script that kickstarted this little project](https://codeberg.org/brank/split-certs-online)
+- AI chatbots, for quick prototyping and taking the blame for any shitty code
