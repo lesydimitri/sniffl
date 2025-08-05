@@ -13,11 +13,9 @@
 - Supports multiple protocols with STARTTLS: SMTP, IMAP, POP3, and plain TLS
 - Fetches full certificate chains from remote servers
 - Export the DNS names found in certificates to a file
-- Exports certificates as individual PEM files, standalone bundles, or full bundles including trusted root CAs
-- Automatically fetches and includes Mozilla's CA bundle for comprehensive trust verification
+- Exports certificates as individual PEM files, standalone bundles, or full bundles including trusted root CAs (System + Mozilla)
 - Exports system-trusted certificate authorities from both macOS and Windows stores for root CA inclusion
 - Protocol guessing based on common ports if not explicitly specified
-- Minimal external dependencies — built with Go for cross-platform usage
 
 ## Installation
 
