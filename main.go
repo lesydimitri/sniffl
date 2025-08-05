@@ -28,6 +28,7 @@ var (
 	hostPort          string
 	filePath          string
 	dnsExportFilePath string
+	verbose           bool
 )
 
 type Target struct {
@@ -56,6 +57,8 @@ func init() {
 	flag.StringVar(&hostPort, "H", "", "Target hostname and port (e.g. smtp.example.com:587)")
 	flag.StringVar(&filePath, "F", "", "File with list of targets (host:port [protocol] per line)")
 	flag.StringVar(&dnsExportFilePath, "exportdns", "", "Export all DNS names found to specified file")
+	flag.BoolVar(&verbose, "v", false, "Enable verbose debug logging")
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose debug logging (long form)")
 	flag.Usage = func() { usage("") }
 	log.SetFlags(0)
 }
@@ -66,25 +69,34 @@ func usage(reason string) {
 	}
 	fmt.Fprintln(os.Stderr, asciiBanner)
 	fmt.Fprintf(os.Stderr, `
-Usage: %s [--export=single|bundle|full_bundle] (-H host:port | -F filename) [protocol] [--exportdns=filename]
+Usage: %s [--export=single|bundle|full_bundle] (-H host:port | -F filename) [protocol] [--exportdns=filename] [--verbose]
 
-  --export     Export certificates:
-                 'single'      - separate PEM files
-                 'bundle'      - single PEM file
-                 'full_bundle' - with trusted root CAs appended
+--export     Export certificates:
+				'single'      - separate PEM files
+				'bundle'      - single PEM file
+				'full_bundle' - with trusted root CAs appended
 
-  --exportdns  Export all unique DNS names found in the certificates to the specified file
+--exportdns  Export all unique DNS names found in the certificates to the specified file
 
-  -H           Target hostname and port (e.g. smtp.example.com:587)
-  -F           File containing targets (host:port [protocol] per line)
-  protocol     STARTTLS protocol to use (smtp, imap, pop3, none). Only valid with -H
+--verbose    Enable verbose debug logging (same as -v)
+-v           Short form of --verbose
+
+-H           Target hostname and port (e.g. smtp.example.com:587)
+-F           File containing targets (host:port [protocol] per line)
+protocol     STARTTLS protocol to use (smtp, imap, pop3, none). Only valid with -H
 
 Notes:
-  - Exactly one of -H or -F must be provided.
-  - If -F is used, protocol specified on the command line is ignored; protocol must be provided per line in the file if needed.
-  - If no protocol is specified, the tool will guess based on the port.
+- Exactly one of -H or -F must be provided.
+- If -F is used, protocol specified on the command line is ignored; protocol must be provided per line in the file if needed.
+- If no protocol is specified, the tool will guess based on the port.
 `, toolName)
 	os.Exit(3)
+}
+
+func debugf(format string, args ...interface{}) {
+	if verbose {
+		log.Printf("[DEBUG] "+format, args...)
+	}
 }
 
 func fatalf(format string, a ...interface{}) {
@@ -535,6 +547,16 @@ func fetchAndAppendCABundle(certs *[]*x509.Certificate) error {
 		}
 	}
 
+	// On macOS, include macOS keychain root certificates.
+	if isDarwin() {
+		macRoots, err := getMacOSCertStoreRoots()
+		if err != nil {
+			log.Printf("[!] Warning: Failed to load macOS cert store: %v", err)
+		} else {
+			*certs = append(*certs, macRoots...)
+		}
+	}
+
 	bundlePath, err := fetchCABundle(caBundleURL)
 	if err != nil {
 		return err
@@ -549,6 +571,10 @@ func fetchAndAppendCABundle(certs *[]*x509.Certificate) error {
 
 func isWindows() bool {
 	return runtime.GOOS == "windows"
+}
+
+func isDarwin() bool {
+	return runtime.GOOS == "darwin"
 }
 
 func getLocalHostname() string {

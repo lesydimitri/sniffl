@@ -1,11 +1,10 @@
 //go:build windows
-// +build windows
 
 package main
 
 import (
 	"crypto/x509"
-	"log"
+	"fmt"
 	"syscall"
 	"unsafe"
 
@@ -22,7 +21,7 @@ func getWindowsCertStoreRoots() ([]*x509.Certificate, error) {
 
 	fetch := func(storeProvider uint32, storeName *uint16) {
 		storeNameStr := syscall.UTF16ToString((*[256]uint16)(unsafe.Pointer(storeName))[:])
-		log.Printf("[DEBUG] Opening store %s, provider 0x%x", storeNameStr, storeProvider)
+		debugf("Opening store %s, provider 0x%x", storeNameStr, storeProvider)
 
 		storeHandle, err := windows.CertOpenStore(
 			windows.CERT_STORE_PROV_SYSTEM,
@@ -32,7 +31,7 @@ func getWindowsCertStoreRoots() ([]*x509.Certificate, error) {
 			uintptr(unsafe.Pointer(storeName)),
 		)
 		if err != nil {
-			log.Printf("[DEBUG] Failed to open store %s: %v", storeNameStr, err)
+			debugf("Failed to open store %s: %v", storeNameStr, err)
 			return
 		}
 		defer windows.CertCloseStore(storeHandle, 0)
@@ -44,7 +43,7 @@ func getWindowsCertStoreRoots() ([]*x509.Certificate, error) {
 				break
 			}
 			if err != nil {
-				log.Printf("[DEBUG] CertEnumCertificatesInStore error: %v", err)
+				debugf("CertEnumCertificatesInStore error: %v", err)
 				break
 			}
 
@@ -62,7 +61,7 @@ func getWindowsCertStoreRoots() ([]*x509.Certificate, error) {
 			cert, parseErr := x509.ParseCertificate(data)
 			if parseErr != nil {
 				// Log and skip certificates that fail parsing (e.g., negative serial number)
-				log.Printf("[DEBUG] Skipping cert in store %s due to parse error: %v", storeNameStr, parseErr)
+				debugf("Skipping cert in store %s due to parse error: %v", storeNameStr, parseErr)
 				windows.CertFreeCertificateContext(dupCtx)
 				continue
 			}
@@ -81,4 +80,9 @@ func getWindowsCertStoreRoots() ([]*x509.Certificate, error) {
 	fetch(windows.CERT_SYSTEM_STORE_CURRENT_USER, syscall.StringToUTF16Ptr(currentUserStoreName))
 
 	return certs, nil
+}
+
+// Stub for Mac root access, so Windows build compiles cleanly.
+func getMacOSCertStoreRoots() ([]*x509.Certificate, error) {
+	return nil, fmt.Errorf("getWindowsCertStoreRoots is not implemented on this platform")
 }

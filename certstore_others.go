@@ -1,12 +1,17 @@
-//go:build !windows
-// +build !windows
+//go:build !windows && !darwin
 
 package main
 
-import "crypto/x509"
+import (
+	"crypto/x509"
+	"errors"
+	"fmt"
+)
 
-// For non-Windows platforms, return no certificates or a stub error.
 func getWindowsCertStoreRoots() ([]*x509.Certificate, error) {
-	return nil, nil
+	return nil, fmt.Errorf("getWindowsCertStoreRoots is not implemented on this platform")
 }
 
+func getMacOSCertStoreRoots() ([]*x509.Certificate, error) {
+	return nil, errors.New("not supported on this platform")
+}
