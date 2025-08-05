@@ -1,5 +1,3 @@
-// sniffl.go
-//
 //go:debug x509negativeserial=1
 package main
 
@@ -15,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 )
@@ -25,9 +24,10 @@ const (
 )
 
 var (
-	exportMode string
-	hostPort   string
-	filePath   string
+	exportMode        string
+	hostPort          string
+	filePath          string
+	dnsExportFilePath string
 )
 
 type Target struct {
@@ -55,6 +55,7 @@ func init() {
 	flag.StringVar(&exportMode, "export", "", "Export mode: 'single', 'bundle', or 'full_bundle'")
 	flag.StringVar(&hostPort, "H", "", "Target hostname and port (e.g. smtp.example.com:587)")
 	flag.StringVar(&filePath, "F", "", "File with list of targets (host:port [protocol] per line)")
+	flag.StringVar(&dnsExportFilePath, "exportdns", "", "Export all DNS names found to specified file")
 	flag.Usage = func() { usage("") }
 	log.SetFlags(0)
 }
@@ -65,12 +66,14 @@ func usage(reason string) {
 	}
 	fmt.Fprintln(os.Stderr, asciiBanner)
 	fmt.Fprintf(os.Stderr, `
-Usage: %s [--export=single|bundle|full_bundle] (-H host:port | -F filename) [protocol]
+Usage: %s [--export=single|bundle|full_bundle] (-H host:port | -F filename) [protocol] [--exportdns=filename]
 
   --export     Export certificates:
                  'single'      - separate PEM files
                  'bundle'      - single PEM file
                  'full_bundle' - with trusted root CAs appended
+
+  --exportdns  Export all unique DNS names found in the certificates to the specified file
 
   -H           Target hostname and port (e.g. smtp.example.com:587)
   -F           File containing targets (host:port [protocol] per line)
@@ -117,6 +120,8 @@ func main() {
 
 	var allCerts []*x509.Certificate
 
+	dnsNamesSet := make(map[string]struct{})
+
 	for _, t := range targets {
 		host, port, err := net.SplitHostPort(t.HostPort)
 		if err != nil {
@@ -155,6 +160,9 @@ func main() {
 		fmt.Printf("[*] Report for %s\n\n", t.HostPort)
 		for i, cert := range certs {
 			displayCertInfo(cert, i)
+			for _, dns := range cert.DNSNames {
+				dnsNamesSet[dns] = struct{}{}
+			}
 		}
 
 		switch exportMode {
@@ -169,6 +177,19 @@ func main() {
 
 	if exportMode == "bundle" || exportMode == "full_bundle" {
 		handleFinalExport(exportMode, allCerts)
+	}
+
+	if dnsExportFilePath != "" {
+		file, err := os.Create(dnsExportFilePath)
+		if err != nil {
+			log.Printf("[-] Failed to create DNS export file %s: %v", dnsExportFilePath, err)
+		} else {
+			defer file.Close()
+			for dns := range dnsNamesSet {
+				_, _ = file.WriteString(dns + "\n")
+			}
+			fmt.Printf("[+] Exported DNS names to %s\n", dnsExportFilePath)
+		}
 	}
 
 	fmt.Println("[*] Done.")
@@ -376,19 +397,78 @@ func exportCertBundleToFile(certs []*x509.Certificate, filename string) error {
 	return nil
 }
 
-func fetchCABundle(url, outPath string) error {
-	resp, err := http.Get(url)
+func cacheDir() string {
+	var cache string
+	switch runtime.GOOS {
+	case "windows":
+		localAppData := os.Getenv("LOCALAPPDATA")
+		if localAppData != "" {
+			cache = filepath.Join(localAppData, "sniffl")
+		} else {
+			home := os.Getenv("USERPROFILE")
+			cache = filepath.Join(home, "AppData", "Local", "sniffl")
+		}
+	case "darwin":
+		cache = filepath.Join(os.Getenv("HOME"), "Library", "Caches", "sniffl")
+	default:
+		xdg := os.Getenv("XDG_CACHE_HOME")
+		if xdg != "" {
+			cache = filepath.Join(xdg, "sniffl")
+		} else {
+			cache = filepath.Join(os.Getenv("HOME"), ".cache", "sniffl")
+		}
+	}
+	os.MkdirAll(cache, 0o755)
+	return cache
+}
+
+func fetchCABundle(url string) (string, error) {
+	dir := cacheDir()
+	caBundlePath := filepath.Join(dir, "cacert.pem")
+	etagPath := filepath.Join(dir, "cacert.etag")
+
+	var etag string
+	if data, err := os.ReadFile(etagPath); err == nil {
+		etag = string(data)
+	}
+
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return err
+		return "", err
+	}
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
 	}
 	defer resp.Body.Close()
-	out, err := os.Create(outPath)
-	if err != nil {
-		return err
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		out, err := os.Create(caBundlePath)
+		if err != nil {
+			return "", err
+		}
+		defer out.Close()
+		if _, err = io.Copy(out, resp.Body); err != nil {
+			return "", err
+		}
+		newEtag := resp.Header.Get("ETag")
+		if newEtag != "" {
+			os.WriteFile(etagPath, []byte(newEtag), 0o644)
+		}
+		fmt.Printf("[+] Downloaded new cacert.pem (%s)\n", caBundlePath)
+	case http.StatusNotModified:
+		fmt.Printf("[*] CA bundle up to date (using cached %s)\n", caBundlePath)
+	default:
+		return "", fmt.Errorf("unexpected status: %s", resp.Status)
 	}
-	defer out.Close()
-	_, err = io.Copy(out, resp.Body)
-	return err
+
+	return caBundlePath, nil
 }
 
 func loadTrustedCABundle(path string) ([]*x509.Certificate, error) {
@@ -455,11 +535,11 @@ func fetchAndAppendCABundle(certs *[]*x509.Certificate) error {
 		}
 	}
 
-	// Always append the Mozilla/curl PEM bundle
-	if err := fetchCABundle(caBundleURL, "cacert.pem"); err != nil {
+	bundlePath, err := fetchCABundle(caBundleURL)
+	if err != nil {
 		return err
 	}
-	caCerts, err := loadTrustedCABundle("cacert.pem")
+	caCerts, err := loadTrustedCABundle(bundlePath)
 	if err != nil {
 		return err
 	}
