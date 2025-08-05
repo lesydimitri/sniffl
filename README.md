@@ -1,6 +1,10 @@
 # sniffl 🐽
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/lesydimitri/sniffl.svg)](https://pkg.go.dev/github.com/lesydimitri/sniffl)
+[![Build Status](https://github.com/lesydimitri/sniffl/actions/workflows/release.yml/badge.svg)](https://github.com/lesydimitri/sniffl/actions)
+[![GitHub release](https://img.shields.io/github/v/release/lesydimitri/sniffl)](https://github.com/<USER>/<REPO>/releases)
+[![Go Report Card](https://goreportcard.com/badge/github.com/lesydimitri/sniffl)](https://goreportcard.com/report/github.com/lesydimitri/sniffl)
+
 
 **sniffl** is a **Certificate Sniffing & Export Tool** designed to fetch, inspect, and export TLS certificates from remote servers using multiple protocols including SMTP, IMAP, POP3, or plain TLS connection.
 
@@ -26,8 +30,6 @@ go install github.com/lesydimitri/sniffl@latest
 ```
 GOOS=windows GOARCH=amd64 go build
 ```
-
----
 
 ## Usage
 
@@ -90,3 +92,9 @@ Contributions, issues, and feature requests are welcome! Feel free to check the 
 
 - Brank, for [the script that kickstarted this little project](https://codeberg.org/brank/split-certs-online)
 - AI chatbots, for quick prototyping and taking the blame for any shitty code
+
+## Support
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/codingkoala)
+
+![alt text](https://media1.tenor.com/m/wUEW1CEbQHkAAAAd/change-please.gif)
