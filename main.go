@@ -63,6 +63,156 @@ func init() {
 	log.SetFlags(0)
 }
 
+func main() {
+	flag.Parse()
+
+	handleHelpFlag()
+
+	if err := validateInput(); err != nil {
+		fatalf(err.Error())
+	}
+
+	manualProtocol := extractManualProtocol()
+	targets, err := parseTargets(filePath, hostPort, manualProtocol)
+	if err != nil {
+		fatalf("Failed to parse targets: %v", err)
+	}
+
+	processTargets(targets)
+	finalizeExport()
+	fmt.Println("[*] Done.")
+}
+
+func handleHelpFlag() {
+	for _, arg := range os.Args[1:] {
+		if arg == "-h" || arg == "--help" {
+			flag.Usage()
+			os.Exit(0)
+		}
+	}
+}
+
+func validateInput() error {
+	if (hostPort == "" && filePath == "") || (hostPort != "" && filePath != "") {
+		return fmt.Errorf("Exactly one of -H or -F must be specified")
+	}
+	return nil
+}
+
+func extractManualProtocol() string {
+	if args := flag.Args(); len(args) > 0 {
+		manualProtocol := strings.ToLower(args[0])
+		if !supportedProtocols[manualProtocol] {
+			usage("Unsupported protocol: " + manualProtocol)
+		}
+		return manualProtocol
+	}
+	return ""
+}
+
+var allCerts []*x509.Certificate
+var dnsNamesSet = make(map[string]struct{})
+
+func processTargets(targets []Target) {
+	for _, t := range targets {
+		host, port, err := net.SplitHostPort(t.HostPort)
+		if err != nil {
+			log.Printf("[-] Invalid host:port format: %s", t.HostPort)
+			continue
+		}
+
+		protocol := resolveProtocol(t.Protocol, port, t.HostPort)
+		certs, err := fetchCertsByProtocol(protocol, host, port, t.HostPort)
+		if err != nil {
+			log.Printf("[-] Failed to fetch certs from %s: %v", t.HostPort, err)
+			continue
+		}
+
+		displayCertReport(t.HostPort, certs)
+		recordDNSNames(certs)
+		exportCertsIfNeeded(certs, host)
+		if exportMode == "bundle" || exportMode == "full_bundle" {
+			allCerts = append(allCerts, certs...)
+		}
+	}
+}
+
+func finalizeExport() {
+	if exportMode == "bundle" || exportMode == "full_bundle" {
+		handleFinalExport(exportMode, allCerts)
+	}
+
+	if dnsExportFilePath != "" {
+		if err := writeDNSNamesToFile(dnsExportFilePath); err != nil {
+			log.Printf("[-] Failed to write DNS names: %v", err)
+		}
+	}
+}
+
+func resolveProtocol(proto, port, hostPort string) string {
+	if proto != "" {
+		return proto
+	}
+	p := guessProtocol(port)
+	if p != "none" {
+		log.Printf("[!] Protocol guessed for %s: %s", hostPort, p)
+	}
+	return p
+}
+
+func fetchCertsByProtocol(protocol, host, port, hostPort string) ([]*x509.Certificate, error) {
+	switch protocol {
+	case "none":
+		return fetchTLS(host, port)
+	case "smtp":
+		return fetchTLSOverSMTP(host, port)
+	case "imap":
+		return fetchTLSOverIMAP(host, port)
+	case "pop3":
+		return fetchTLSOverPOP3(host, port)
+	default:
+		log.Printf("[-] Unsupported protocol: %s", protocol)
+		return nil, fmt.Errorf("unsupported protocol")
+	}
+}
+
+func displayCertReport(hostPort string, certs []*x509.Certificate) {
+	fmt.Printf("[*] Report for %s\n\n", hostPort)
+	for i, cert := range certs {
+		displayCertInfo(cert, i)
+	}
+}
+
+func recordDNSNames(certs []*x509.Certificate) {
+	for _, cert := range certs {
+		for _, dns := range cert.DNSNames {
+			dnsNamesSet[dns] = struct{}{}
+		}
+	}
+}
+
+func exportCertsIfNeeded(certs []*x509.Certificate, host string) {
+	if exportMode == "single" {
+		if err := exportCertsSingle(certs, host); err != nil {
+			log.Printf("[-] Export failed for %s: %v", host, err)
+		}
+	}
+}
+
+func writeDNSNamesToFile(path string) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	for dns := range dnsNamesSet {
+		_, _ = file.WriteString(dns + "\n")
+	}
+	fmt.Printf("[+] Exported DNS names to %s\n", path)
+	return nil
+}
+
 func usage(reason string) {
 	if reason != "" {
 		fmt.Fprintf(os.Stderr, "%s: %s\n", toolName, reason)
@@ -101,110 +251,6 @@ func debugf(format string, args ...interface{}) {
 
 func fatalf(format string, a ...interface{}) {
 	log.Fatalf("%s: %s", toolName, fmt.Sprintf(format, a...))
-}
-
-func main() {
-	flag.Parse()
-
-	for _, arg := range os.Args[1:] {
-		if arg == "-h" || arg == "--help" {
-			flag.Usage()
-			return
-		}
-	}
-
-	if (hostPort == "" && filePath == "") || (hostPort != "" && filePath != "") {
-		usage("Exactly one of -H or -F must be specified")
-	}
-
-	manualProtocol := ""
-	if args := flag.Args(); len(args) > 0 {
-		manualProtocol = strings.ToLower(args[0])
-		if !supportedProtocols[manualProtocol] {
-			usage("Unsupported protocol: " + manualProtocol)
-		}
-	}
-
-	targets, err := parseTargets(filePath, hostPort, manualProtocol)
-	if err != nil {
-		fatalf("Failed to parse targets: %v", err)
-	}
-
-	var allCerts []*x509.Certificate
-
-	dnsNamesSet := make(map[string]struct{})
-
-	for _, t := range targets {
-		host, port, err := net.SplitHostPort(t.HostPort)
-		if err != nil {
-			log.Printf("[-] Invalid host:port format: %s", t.HostPort)
-			continue
-		}
-
-		protocol := t.Protocol
-		if protocol == "" {
-			protocol = guessProtocol(port)
-			if protocol != "none" {
-				log.Printf("[!] Protocol guessed for %s: %s", t.HostPort, protocol)
-			}
-		}
-
-		var certs []*x509.Certificate
-		switch protocol {
-		case "none":
-			certs, err = fetchTLS(host, port)
-		case "smtp":
-			certs, err = fetchTLSOverSMTP(host, port)
-		case "imap":
-			certs, err = fetchTLSOverIMAP(host, port)
-		case "pop3":
-			certs, err = fetchTLSOverPOP3(host, port)
-		default:
-			log.Printf("[-] Unsupported protocol: %s", protocol)
-			continue
-		}
-
-		if err != nil {
-			log.Printf("[-] Failed to fetch certs from %s: %v", t.HostPort, err)
-			continue
-		}
-
-		fmt.Printf("[*] Report for %s\n\n", t.HostPort)
-		for i, cert := range certs {
-			displayCertInfo(cert, i)
-			for _, dns := range cert.DNSNames {
-				dnsNamesSet[dns] = struct{}{}
-			}
-		}
-
-		switch exportMode {
-		case "single":
-			if err := exportCertsSingle(certs, host); err != nil {
-				log.Printf("[-] Export failed for %s: %v", host, err)
-			}
-		case "bundle", "full_bundle":
-			allCerts = append(allCerts, certs...)
-		}
-	}
-
-	if exportMode == "bundle" || exportMode == "full_bundle" {
-		handleFinalExport(exportMode, allCerts)
-	}
-
-	if dnsExportFilePath != "" {
-		file, err := os.Create(dnsExportFilePath)
-		if err != nil {
-			log.Printf("[-] Failed to create DNS export file %s: %v", dnsExportFilePath, err)
-		} else {
-			defer file.Close()
-			for dns := range dnsNamesSet {
-				_, _ = file.WriteString(dns + "\n")
-			}
-			fmt.Printf("[+] Exported DNS names to %s\n", dnsExportFilePath)
-		}
-	}
-
-	fmt.Println("[*] Done.")
 }
 
 func parseTargets(filePath, hostPort, protocol string) ([]Target, error) {
@@ -537,26 +583,20 @@ func handleFinalExport(exportMode string, certs []*x509.Certificate) {
 }
 
 func fetchAndAppendCABundle(certs *[]*x509.Certificate) error {
-	// On Windows, include Windows root cert store certificates.
 	if isWindows() {
-		winRoots, err := getWindowsCertStoreRoots()
-		if err != nil {
+		if winRoots, err := getWindowsCertStoreRoots(); err != nil {
 			log.Printf("[!] Warning: Failed to load Windows cert store: %v", err)
 		} else {
 			*certs = append(*certs, winRoots...)
 		}
 	}
-
-	// On macOS, include macOS keychain root certificates.
 	if isDarwin() {
-		macRoots, err := getMacOSCertStoreRoots()
-		if err != nil {
+		if macRoots, err := getMacOSCertStoreRoots(); err != nil {
 			log.Printf("[!] Warning: Failed to load macOS cert store: %v", err)
 		} else {
 			*certs = append(*certs, macRoots...)
 		}
 	}
-
 	bundlePath, err := fetchCABundle(caBundleURL)
 	if err != nil {
 		return err
