@@ -21,7 +21,7 @@ jobs:
           mkdir -p dist
           GOOS=windows GOARCH=amd64 go build -o dist/sniffl-amd64.exe .
           GOOS=linux GOARCH=amd64 go build -o dist/sniffl-linux-amd64 .
-          GOOS=darwin GOARCH=arm64 go build -o dist/sniffl-mac-arm64 .
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -o dist/sniffl-mac-arm64 .
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
