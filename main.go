@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -28,6 +30,7 @@ var (
 	hostPort          string
 	filePath          string
 	dnsExportFilePath string
+	httpsProxy        string
 	verbose           bool
 )
 
@@ -40,6 +43,7 @@ var supportedProtocols = map[string]bool{
 	"smtp": true,
 	"imap": true,
 	"pop3": true,
+	"http": true,
 	"none": true,
 }
 
@@ -59,6 +63,7 @@ func init() {
 	flag.StringVar(&dnsExportFilePath, "exportdns", "", "Export all DNS names found to specified file")
 	flag.BoolVar(&verbose, "v", false, "Enable verbose debug logging")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose debug logging (long form)")
+	flag.StringVar(&httpsProxy, "https_proxy", "", "HTTP proxy URL (e.g. http://user:pass@127.0.0.1:8080)") // NEW
 	flag.Usage = func() { usage("") }
 	log.SetFlags(0)
 }
@@ -170,6 +175,8 @@ func fetchCertsByProtocol(protocol, host, port, hostPort string) ([]*x509.Certif
 		return fetchTLSOverIMAP(host, port)
 	case "pop3":
 		return fetchTLSOverPOP3(host, port)
+	case "http":
+		return fetchTLSOverHTTP(host, port)
 	default:
 		log.Printf("[-] Unsupported protocol: %s", protocol)
 		return nil, fmt.Errorf("unsupported protocol")
@@ -219,26 +226,31 @@ func usage(reason string) {
 	}
 	fmt.Fprintln(os.Stderr, asciiBanner)
 	fmt.Fprintf(os.Stderr, `
-Usage: %s [--export=single|bundle|full_bundle] (-H host:port | -F filename) [protocol] [--exportdns=filename] [--verbose]
+Usage: %s [--export=single|bundle|full_bundle] (-H host:port | -F filename) [protocol] [--exportdns=filename] [--https_proxy=proxyurl] [--verbose]
 
---export     Export certificates:
-				'single'      - separate PEM files
-				'bundle'      - single PEM file
-				'full_bundle' - with trusted root CAs appended
+--export        Export certificates:
+                    'single'      - separate PEM files
+                    'bundle'      - single PEM file
+                    'full_bundle' - with trusted root CAs appended
 
---exportdns  Export all unique DNS names found in the certificates to the specified file
+--exportdns     Export all unique DNS names found in the certificates to the specified file
 
---verbose    Enable verbose debug logging (same as -v)
--v           Short form of --verbose
+--https_proxy   HTTP proxy URL for tunneling. Supports authentication, e.g.:
+                    --https_proxy="http://user:pass@proxyhost:port"
+                If set, all connections for the "http" protocol will use this proxy for CONNECT tunneling.
 
--H           Target hostname and port (e.g. smtp.example.com:587)
--F           File containing targets (host:port [protocol] per line)
-protocol     STARTTLS protocol to use (smtp, imap, pop3, none). Only valid with -H
+--verbose       Enable verbose debug logging (same as -v)
+-v              Short form of --verbose
+
+-H              Target hostname and port (e.g. smtp.example.com:587)
+-F              File containing targets (host:port [protocol] per line)
+protocol        STARTTLS protocol to use (smtp, imap, pop3, http, none). Only valid with -H
 
 Notes:
 - Exactly one of -H or -F must be provided.
 - If -F is used, protocol specified on the command line is ignored; protocol must be provided per line in the file if needed.
-- If no protocol is specified, the tool will guess based on the port.
+- If no protocol is specified, the tool will guess based on the port (443 -> http).
+- The http protocol is for direct TLS (i.e., HTTPS) with optional HTTP proxy tunneling. Use --https_proxy if tunneling is needed.
 `, toolName)
 	os.Exit(3)
 }
@@ -299,6 +311,8 @@ func guessProtocol(port string) string {
 		return "imap"
 	case "110":
 		return "pop3"
+	case "443":
+		return "http"
 	default:
 		return "none"
 	}
@@ -338,6 +352,79 @@ func fetchTLSWithStartTLS(conn net.Conn, initFunc func(*bufio.Writer, *bufio.Rea
 		return nil, err
 	}
 	defer tlsConn.Close()
+	return tlsConn.ConnectionState().PeerCertificates, nil
+}
+
+func fetchTLSOverHTTP(host, port string) ([]*x509.Certificate, error) {
+	addr := net.JoinHostPort(host, port)
+	var conn net.Conn
+	var err error
+
+	if httpsProxy != "" {
+		proxyURL, err := url.Parse(httpsProxy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid https_proxy: %v", err)
+		}
+
+		proxyConn, err := net.Dial("tcp", proxyURL.Host)
+		if err != nil {
+			return nil, fmt.Errorf("cannot connect to proxy: %v", err)
+		}
+
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
+
+		// Add basic auth header if credentials are supplied
+		if proxyURL.User != nil {
+			username := proxyURL.User.Username()
+			password, _ := proxyURL.User.Password()
+			auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+			connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", auth)
+		}
+
+		connectReq += "\r\n"
+		if _, err := proxyConn.Write([]byte(connectReq)); err != nil {
+			proxyConn.Close()
+			return nil, fmt.Errorf("proxy write failed: %v", err)
+		}
+
+		reader := bufio.NewReader(proxyConn)
+		statusLine, err := reader.ReadString('\n')
+		if err != nil || !strings.Contains(statusLine, "200") {
+			proxyConn.Close()
+			return nil, fmt.Errorf("proxy connect failed: %s", strings.TrimSpace(statusLine))
+		}
+
+		// Consume headers
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				proxyConn.Close()
+				return nil, fmt.Errorf("proxy header read error: %v", err)
+			}
+			if line == "\r\n" || line == "\n" {
+				break
+			}
+		}
+
+		conn = proxyConn
+	} else {
+		conn, err = net.Dial("tcp", addr)
+		if err != nil {
+			return nil, fmt.Errorf("cannot connect directly: %v", err)
+		}
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: true,
+	})
+
+	if err := tlsConn.Handshake(); err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("TLS handshake error: %v", err)
+	}
+	defer tlsConn.Close()
+
 	return tlsConn.ConnectionState().PeerCertificates, nil
 }
 
