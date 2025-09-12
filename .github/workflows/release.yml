@@ -9,23 +9,53 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
-      - name: Checkout source
+      - name: 🚚 Checkout source
         uses: actions/checkout@v3
 
-      - name: Set up Go
+      - name: 🧰 Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.21'
+          go-version: 'stable'
 
-      - name: Build binaries
+      - name: 🏗️ Build binaries
         run: |
+          VERSION="${{ github.event.release.tag_name }}"
           mkdir -p dist
-          GOOS=windows GOARCH=amd64 go build -o dist/sniffl-amd64.exe .
-          GOOS=linux GOARCH=amd64 go build -o dist/sniffl-linux-amd64 .
-          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -o dist/sniffl-mac-arm64 .
 
-      - name: Upload release assets
+          platforms=(
+            "linux amd64"
+            "linux arm64"
+            "windows amd64"
+            "windows arm64"
+            "darwin amd64"
+            "darwin arm64"
+            "openbsd amd64"
+            "openbsd arm64"
+          )
+
+          for platform in "${platforms[@]}"; do
+            os=$(echo "$platform" | cut -d' ' -f1)
+            arch=$(echo "$platform" | cut -d' ' -f2)
+
+            output="sniffl-${os}-${arch}"
+            [ "$os" = "windows" ] && output="${output}.exe"
+
+            echo "Building $output"
+
+            if [ "$os" = "darwin" ]; then
+              CGO_ENABLED=1
+            else
+              CGO_ENABLED=0
+            fi
+
+            GOOS=$os GOARCH=$arch CGO_ENABLED=$CGO_ENABLED go build \
+              -ldflags "-X 'main.toolVersion=${VERSION}'" \
+              -o "dist/${output}" .
+          done
+
+      - name: 📦 Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*

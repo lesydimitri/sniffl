@@ -31,6 +31,7 @@ var (
 	filePath          string
 	dnsExportFilePath string
 	httpsProxy        string
+	toolVersion       = "0.5.0"
 	verbose           bool
 )
 
@@ -47,15 +48,6 @@ var supportedProtocols = map[string]bool{
 	"none": true,
 }
 
-var asciiBanner = `
- ▗▄▄▖▗▖  ▗▖▗▄▄▄▖▗▄▄▄▖▗▄▄▄▖▗▖   
-▐▌   ▐▛▚▖▐▌  █  ▐▌   ▐▌   ▐▌   
- ▝▀▚▖▐▌ ▝▜▌  █  ▐▛▀▀▘▐▛▀▀▘▐▌   
-▗▄▄▞▘▐▌  ▐▌▗▄█▄▖▐▌   ▐▌   ▐▙▄▄▖
-
-Certificate Sniffing & Export Tool
-`
-
 func init() {
 	flag.StringVar(&exportMode, "export", "", "Export mode: 'single', 'bundle', or 'full_bundle'")
 	flag.StringVar(&hostPort, "H", "", "Target hostname and port (e.g. smtp.example.com:587)")
@@ -63,7 +55,7 @@ func init() {
 	flag.StringVar(&dnsExportFilePath, "exportdns", "", "Export all DNS names found to specified file")
 	flag.BoolVar(&verbose, "v", false, "Enable verbose debug logging")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose debug logging (long form)")
-	flag.StringVar(&httpsProxy, "https_proxy", "", "HTTP proxy URL (e.g. http://user:pass@127.0.0.1:8080)") // NEW
+	flag.StringVar(&httpsProxy, "https_proxy", "", "HTTP proxy URL (e.g. http://user:pass@127.0.0.1:8080)")
 	flag.Usage = func() { usage("") }
 	log.SetFlags(0)
 }
@@ -74,7 +66,7 @@ func main() {
 	handleHelpFlag()
 
 	if err := validateInput(); err != nil {
-		fatalf(err.Error())
+		fatalf("%s", err.Error())
 	}
 
 	manualProtocol := extractManualProtocol()
@@ -99,7 +91,7 @@ func handleHelpFlag() {
 
 func validateInput() error {
 	if (hostPort == "" && filePath == "") || (hostPort != "" && filePath != "") {
-		return fmt.Errorf("Exactly one of -H or -F must be specified")
+		return fmt.Errorf("specify a target host with -H or a file containing one target per line using -F")
 	}
 	return nil
 }
@@ -225,33 +217,8 @@ func usage(reason string) {
 		fmt.Fprintf(os.Stderr, "%s: %s\n", toolName, reason)
 	}
 	fmt.Fprintln(os.Stderr, asciiBanner)
-	fmt.Fprintf(os.Stderr, `
-Usage: %s [--export=single|bundle|full_bundle] (-H host:port | -F filename) [protocol] [--exportdns=filename] [--https_proxy=proxyurl] [--verbose]
-
---export        Export certificates:
-                    'single'      - separate PEM files
-                    'bundle'      - single PEM file
-                    'full_bundle' - with trusted root CAs appended
-
---exportdns     Export all unique DNS names found in the certificates to the specified file
-
---https_proxy   HTTP proxy URL for tunneling. Supports authentication, e.g.:
-                    --https_proxy="http://user:pass@proxyhost:port"
-                If set, all connections for the "http" protocol will use this proxy for CONNECT tunneling.
-
---verbose       Enable verbose debug logging (same as -v)
--v              Short form of --verbose
-
--H              Target hostname and port (e.g. smtp.example.com:587)
--F              File containing targets (host:port [protocol] per line)
-protocol        STARTTLS protocol to use (smtp, imap, pop3, http, none). Only valid with -H
-
-Notes:
-- Exactly one of -H or -F must be provided.
-- If -F is used, protocol specified on the command line is ignored; protocol must be provided per line in the file if needed.
-- If no protocol is specified, the tool will guess based on the port (443 -> http).
-- The http protocol is for direct TLS (i.e., HTTPS) with optional HTTP proxy tunneling. Use --https_proxy if tunneling is needed.
-`, toolName)
+	fmt.Fprintln(os.Stderr, toolVersion)
+	fmt.Fprintln(os.Stderr, usageText)
 	os.Exit(3)
 }
 
@@ -262,7 +229,7 @@ func debugf(format string, args ...interface{}) {
 }
 
 func fatalf(format string, a ...interface{}) {
-	log.Fatalf("%s: %s", toolName, fmt.Sprintf(format, a...))
+	log.Fatalf("%s: %s\nPass -h or --help for usage instructions.", toolName, fmt.Sprintf(format, a...))
 }
 
 func parseTargets(filePath, hostPort, protocol string) ([]Target, error) {
