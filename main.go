@@ -219,7 +219,7 @@ func usage(reason string) {
 	fmt.Fprintln(os.Stderr, asciiBanner)
 	fmt.Fprintln(os.Stderr, toolVersion)
 	fmt.Fprintln(os.Stderr, usageText)
-	os.Exit(3)
+	os.Exit(2)
 }
 
 func debugf(format string, args ...interface{}) {
