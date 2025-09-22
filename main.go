@@ -31,7 +31,7 @@ var (
 	filePath          string
 	dnsExportFilePath string
 	httpsProxy        string
-	toolVersion       = "0.5.0"
+	toolVersion       = "dev"
 	verbose           bool
 )
 
@@ -62,7 +62,6 @@ func init() {
 
 func main() {
 	flag.Parse()
-
 	handleHelpFlag()
 
 	if err := validateInput(); err != nil {
@@ -93,7 +92,26 @@ func validateInput() error {
 	if (hostPort == "" && filePath == "") || (hostPort != "" && filePath != "") {
 		return fmt.Errorf("specify a target host with -H or a file containing one target per line using -F")
 	}
+	if hostPort != "" {
+		if !isValidHostPort(hostPort) {
+			return fmt.Errorf("invalid host:port format: %s", hostPort)
+		}
+	}
+	if filePath != "" {
+		if _, err := os.Stat(filePath); err != nil {
+			return fmt.Errorf("specified file does not exist or cannot be accessed: %s", filePath)
+		}
+	}
 	return nil
+}
+
+// Added input validation for host:port format
+func isValidHostPort(hp string) bool {
+	host, port, err := net.SplitHostPort(hp)
+	if err != nil || host == "" || port == "" {
+		return false
+	}
+	return true
 }
 
 func extractManualProtocol() string {
@@ -112,16 +130,20 @@ var dnsNamesSet = make(map[string]struct{})
 
 func processTargets(targets []Target) {
 	for _, t := range targets {
+		if !isValidHostPort(t.HostPort) {
+			log.Printf("[-] Invalid host:port format: %s (skipped)", t.HostPort)
+			continue
+		}
 		host, port, err := net.SplitHostPort(t.HostPort)
 		if err != nil {
-			log.Printf("[-] Invalid host:port format: %s", t.HostPort)
+			log.Printf("[-] Invalid host:port format (runtime): %s", t.HostPort)
 			continue
 		}
 
 		protocol := resolveProtocol(t.Protocol, port, t.HostPort)
 		certs, err := fetchCertsByProtocol(protocol, host, port, t.HostPort)
 		if err != nil {
-			log.Printf("[-] Failed to fetch certs from %s: %v", t.HostPort, err)
+			log.Printf("[-] Failed to fetch certs from %s (protocol %s): %v", t.HostPort, protocol, err)
 			continue
 		}
 
@@ -148,6 +170,10 @@ func finalizeExport() {
 
 func resolveProtocol(proto, port, hostPort string) string {
 	if proto != "" {
+		if !supportedProtocols[proto] {
+			log.Printf("[!] Unsupported protocol %q for host %s (skipped)", proto, hostPort)
+			return "none"
+		}
 		return proto
 	}
 	p := guessProtocol(port)
@@ -170,8 +196,8 @@ func fetchCertsByProtocol(protocol, host, port, hostPort string) ([]*x509.Certif
 	case "http":
 		return fetchTLSOverHTTP(host, port)
 	default:
-		log.Printf("[-] Unsupported protocol: %s", protocol)
-		return nil, fmt.Errorf("unsupported protocol")
+		log.Printf("[-] Unsupported protocol: %s for host: %s", protocol, hostPort)
+		return nil, fmt.Errorf("unsupported protocol %q for host %s", protocol, hostPort)
 	}
 }
 
@@ -201,12 +227,14 @@ func exportCertsIfNeeded(certs []*x509.Certificate, host string) {
 func writeDNSNamesToFile(path string) error {
 	file, err := os.Create(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create DNS export file %q: %w", path, err)
 	}
 	defer file.Close()
 
 	for dns := range dnsNamesSet {
-		_, _ = file.WriteString(dns + "\n")
+		if _, err := file.WriteString(dns + "\n"); err != nil {
+			return fmt.Errorf("failed to write DNS name %q: %w", dns, err)
+		}
 	}
 	fmt.Printf("[+] Exported DNS names to %s\n", path)
 	return nil
@@ -237,7 +265,7 @@ func parseTargets(filePath, hostPort, protocol string) ([]Target, error) {
 	if filePath != "" {
 		file, err := os.Open(filePath)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to open file %q: %w", filePath, err)
 		}
 		defer file.Close()
 		scanner := bufio.NewScanner(file)
@@ -251,6 +279,10 @@ func parseTargets(filePath, hostPort, protocol string) ([]Target, error) {
 				continue
 			}
 			target := Target{HostPort: fields[0]}
+			if !isValidHostPort(target.HostPort) {
+				log.Printf("[!] Skipping line %d (invalid host:port): %s", lineNum, line)
+				continue
+			}
 			if len(fields) > 1 {
 				proto := strings.ToLower(fields[1])
 				if !supportedProtocols[proto] {
@@ -262,7 +294,7 @@ func parseTargets(filePath, hostPort, protocol string) ([]Target, error) {
 			targets = append(targets, target)
 		}
 		if err := scanner.Err(); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed reading file %q: %w", filePath, err)
 		}
 	} else {
 		targets = append(targets, Target{HostPort: hostPort, Protocol: protocol})
@@ -271,6 +303,9 @@ func parseTargets(filePath, hostPort, protocol string) ([]Target, error) {
 }
 
 func guessProtocol(port string) string {
+	if port == "" {
+		return "none"
+	}
 	switch port {
 	case "25", "587":
 		return "smtp"
@@ -285,13 +320,15 @@ func guessProtocol(port string) string {
 	}
 }
 
+// SECURITY NOTE: InsecureSkipVerify is used intentionally for certificate analysis.
+// This tool examines certificates without validating trust chains.
 func fetchTLS(host, port string) ([]*x509.Certificate, error) {
 	conn, err := tls.Dial("tcp", net.JoinHostPort(host, port), &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("TLS dial error for %s:%s: %w", host, port, err)
 	}
 	defer conn.Close()
 	return conn.ConnectionState().PeerCertificates, nil
@@ -300,7 +337,7 @@ func fetchTLS(host, port string) ([]*x509.Certificate, error) {
 func fetchTLSOverProtocol(host, port string, initFunc func(*bufio.Writer, *bufio.Reader) error) ([]*x509.Certificate, error) {
 	conn, err := net.Dial("tcp", net.JoinHostPort(host, port))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("TCP dial error for %s:%s: %w", host, port, err)
 	}
 	return fetchTLSWithStartTLS(conn, initFunc, host)
 }
@@ -309,14 +346,16 @@ func fetchTLSWithStartTLS(conn net.Conn, initFunc func(*bufio.Writer, *bufio.Rea
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 	if err := initFunc(writer, reader); err != nil {
-		return nil, err
+		conn.Close()
+		return nil, fmt.Errorf("STARTTLS/initFunc error: %w", err)
 	}
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true,
 	})
 	if err := tlsConn.Handshake(); err != nil {
-		return nil, err
+		tlsConn.Close()
+		return nil, fmt.Errorf("TLS handshake error: %w", err)
 	}
 	defer tlsConn.Close()
 	return tlsConn.ConnectionState().PeerCertificates, nil
@@ -377,7 +416,7 @@ func fetchTLSOverHTTP(host, port string) ([]*x509.Certificate, error) {
 	} else {
 		conn, err = net.Dial("tcp", addr)
 		if err != nil {
-			return nil, fmt.Errorf("cannot connect directly: %v", err)
+			return nil, fmt.Errorf("cannot connect directly to %s: %v", addr, err)
 		}
 	}
 
@@ -397,7 +436,9 @@ func fetchTLSOverHTTP(host, port string) ([]*x509.Certificate, error) {
 
 func fetchTLSOverSMTP(host, port string) ([]*x509.Certificate, error) {
 	return fetchTLSOverProtocol(host, port, func(w *bufio.Writer, r *bufio.Reader) error {
-		r.ReadString('\n')
+		if _, err := r.ReadString('\n'); err != nil {
+			return fmt.Errorf("error reading SMTP greeting: %w", err)
+		}
 		fmt.Fprintf(w, "EHLO %s\r\n", getLocalHostname())
 		w.Flush()
 
@@ -405,7 +446,7 @@ func fetchTLSOverSMTP(host, port string) ([]*x509.Certificate, error) {
 		for {
 			line, err := r.ReadString('\n')
 			if err != nil {
-				return err
+				return fmt.Errorf("error reading SMTP EHLO response: %w", err)
 			}
 			if strings.Contains(line, "STARTTLS") {
 				starttls = true
@@ -429,11 +470,16 @@ func fetchTLSOverSMTP(host, port string) ([]*x509.Certificate, error) {
 
 func fetchTLSOverIMAP(host, port string) ([]*x509.Certificate, error) {
 	return fetchTLSOverProtocol(host, port, func(w *bufio.Writer, r *bufio.Reader) error {
-		r.ReadString('\n')
+		if _, err := r.ReadString('\n'); err != nil {
+			return fmt.Errorf("error reading IMAP greeting: %w", err)
+		}
 		fmt.Fprint(w, "A001 STARTTLS\r\n")
 		w.Flush()
 		for {
-			line, _ := r.ReadString('\n')
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return fmt.Errorf("error reading IMAP STARTTLS response: %w", err)
+			}
 			if strings.HasPrefix(strings.ToUpper(line), "A001 ") {
 				if strings.Contains(strings.ToUpper(line), "OK") {
 					return nil
@@ -446,10 +492,15 @@ func fetchTLSOverIMAP(host, port string) ([]*x509.Certificate, error) {
 
 func fetchTLSOverPOP3(host, port string) ([]*x509.Certificate, error) {
 	return fetchTLSOverProtocol(host, port, func(w *bufio.Writer, r *bufio.Reader) error {
-		r.ReadString('\n')
+		if _, err := r.ReadString('\n'); err != nil {
+			return fmt.Errorf("error reading POP3 greeting: %w", err)
+		}
 		fmt.Fprint(w, "STLS\r\n")
 		w.Flush()
-		resp, _ := r.ReadString('\n')
+		resp, err := r.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("error reading POP3 STLS response: %w", err)
+		}
 		if !strings.HasPrefix(resp, "+OK") {
 			return fmt.Errorf("STLS failed: %s", resp)
 		}
@@ -484,7 +535,7 @@ func exportCertsSingle(certs []*x509.Certificate, base string) error {
 	for i, c := range certs {
 		name := fmt.Sprintf("%s_cert_%d.pem", base, i+1)
 		if err := exportCertBundleToFile([]*x509.Certificate{c}, name); err != nil {
-			return err
+			return fmt.Errorf("failed to export cert %d for %s: %w", i+1, base, err)
 		}
 		fmt.Printf("[+] Exported: %s\n", name)
 	}
@@ -494,16 +545,16 @@ func exportCertsSingle(certs []*x509.Certificate, base string) error {
 func exportCertBundleToFile(certs []*x509.Certificate, filename string) error {
 	out, err := os.Create(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create file %q: %w", filename, err)
 	}
 	defer out.Close()
 	for i, cert := range certs {
 		comment := fmt.Sprintf("# Certificate %d\n%s\n", i+1, certificateSummary(cert))
 		if _, err := out.WriteString(comment); err != nil {
-			return err
+			return fmt.Errorf("failed to write cert %d comment in %q: %w", i+1, filename, err)
 		}
 		if err := pem.Encode(out, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}); err != nil {
-			return err
+			return fmt.Errorf("failed to encode cert %d in %q: %w", i+1, filename, err)
 		}
 	}
 	return nil
@@ -547,7 +598,7 @@ func fetchCABundle(url string) (string, error) {
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create HTTP request for CA bundle: %w", err)
 	}
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
@@ -555,7 +606,7 @@ func fetchCABundle(url string) (string, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("CA bundle fetch error: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -563,11 +614,11 @@ func fetchCABundle(url string) (string, error) {
 	case http.StatusOK:
 		out, err := os.Create(caBundlePath)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to create CA bundle file: %w", err)
 		}
 		defer out.Close()
 		if _, err = io.Copy(out, resp.Body); err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to write CA bundle  %w", err)
 		}
 		newEtag := resp.Header.Get("ETag")
 		if newEtag != "" {
@@ -577,7 +628,7 @@ func fetchCABundle(url string) (string, error) {
 	case http.StatusNotModified:
 		fmt.Printf("[*] CA bundle up to date (using cached %s)\n", caBundlePath)
 	default:
-		return "", fmt.Errorf("unexpected status: %s", resp.Status)
+		return "", fmt.Errorf("unexpected CA bundle fetch status: %s", resp.Status)
 	}
 
 	return caBundlePath, nil
@@ -586,7 +637,7 @@ func fetchCABundle(url string) (string, error) {
 func loadTrustedCABundle(path string) ([]*x509.Certificate, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read CA bundle file %q: %w", path, err)
 	}
 	var certs []*x509.Certificate
 	for {
@@ -653,11 +704,11 @@ func fetchAndAppendCABundle(certs *[]*x509.Certificate) error {
 	}
 	bundlePath, err := fetchCABundle(caBundleURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to fetch CA bundle: %w", err)
 	}
 	caCerts, err := loadTrustedCABundle(bundlePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load trusted CA bundle: %w", err)
 	}
 	*certs = append(*certs, caCerts...)
 	return nil

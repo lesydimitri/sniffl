@@ -51,7 +51,7 @@ jobs:
             fi
 
             GOOS=$os GOARCH=$arch CGO_ENABLED=$CGO_ENABLED go build \
-              -ldflags "-X 'main.toolVersion=${VERSION}'" \
+              -ldflags "-X main.toolVersion=${VERSION}" \
               -o "dist/${output}" .
           done
 
