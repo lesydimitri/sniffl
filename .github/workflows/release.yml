@@ -7,55 +7,93 @@ on:
     types: [published]
 
 jobs:
-  build:
-    runs-on: macos-latest
-
+  # Linux and OpenBSD builds (no CGO needed)
+  build-unix:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, openbsd]
+        arch: [amd64, arm64]
     steps:
       - name: 🚚 Checkout source
-        uses: actions/checkout@v3
-
+        uses: actions/checkout@v4
       - name: 🧰 Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
-
-      - name: 🏗️ Build binaries
+          go-version: stable
+      - name: 🏗️ Build ${{ matrix.os }}-${{ matrix.arch }}
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
         run: |
-          VERSION="${{ github.event.release.tag_name }}"
           mkdir -p dist
+          OUT="sniffl-${GOOS}-${GOARCH}"
+          go build -ldflags "-X main.toolVersion=${VERSION}" -o "dist/${OUT}" ./cmd/sniffl
+      - name: 📦 Upload asset (${{ matrix.os }}-${{ matrix.arch }})
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          platforms=(
-            "linux amd64"
-            "linux arm64"
-            "windows amd64"
-            "windows arm64"
-            "darwin amd64"
-            "darwin arm64"
-            "openbsd amd64"
-            "openbsd arm64"
-          )
+  # Windows builds (no CGO needed)
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: 🚚 Checkout source
+        uses: actions/checkout@v4
+      - name: 🧰 Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: 🏗️ Build windows-${{ matrix.arch }}
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        shell: bash
+        run: |
+          mkdir -p dist
+          OUT="sniffl-windows-${GOARCH}.exe"
+          go build -ldflags "-X main.toolVersion=${VERSION}" -o "dist/${OUT}" ./cmd/sniffl
+      - name: 📦 Upload asset (windows-${{ matrix.arch }})
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          for platform in "${platforms[@]}"; do
-            os=$(echo "$platform" | cut -d' ' -f1)
-            arch=$(echo "$platform" | cut -d' ' -f2)
-
-            output="sniffl-${os}-${arch}"
-            [ "$os" = "windows" ] && output="${output}.exe"
-
-            echo "Building $output"
-
-            if [ "$os" = "darwin" ]; then
-              CGO_ENABLED=1
-            else
-              CGO_ENABLED=0
-            fi
-
-            GOOS=$os GOARCH=$arch CGO_ENABLED=$CGO_ENABLED go build \
-              -ldflags "-X main.toolVersion=${VERSION}" \
-              -o "dist/${output}" .
-          done
-
-      - name: 📦 Upload release assets
+  # macOS builds (CGO required for Security.framework)
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: 🚚 Checkout source
+        uses: actions/checkout@v4
+      - name: 🧰 Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: 🏗️ Build darwin-${{ matrix.arch }}
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+          GOOS: darwin
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 1
+        run: |
+          mkdir -p dist
+          OUT="sniffl-darwin-${GOARCH}"
+          # SDK is available on macOS runners; cgo picks up -framework Security from source.
+          go build -ldflags "-X main.toolVersion=${VERSION}" -o "dist/${OUT}" ./cmd/sniffl
+      - name: 📦 Upload asset (darwin-${{ matrix.arch }})
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
