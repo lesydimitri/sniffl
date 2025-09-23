@@ -25,9 +25,9 @@ func init() {
 		fmt.Fprintln(w, asciiBanner)
 		fmt.Fprintf(w, "sniffl %s\n\n", toolVersion)
 
-		fmt.Fprintln(w, "Usage: sniffl [--export=single|bundle|full_bundle] (-H host:port | -F filename) [protocol] [--exportdns=filename] [--https_proxy=proxyurl] [--verbose]")
+		fmt.Fprintln(w, "Usage: sniffl [-export single|bundle|full_bundle] (-H host:port | -F filename) [protocol] [-exportdnsfilename] [-https_proxy=proxyurl] [-verbose]")
 		fmt.Fprintln(w, "Options:")
-		flag.PrintDefaults() // prints all defined flags with defaults and help [web:32]
+		flag.PrintDefaults()
 
 		fmt.Fprintln(w, "\nNotes:")
 		fmt.Fprintln(w, "  - Exactly one of -H or -F must be provided.")
@@ -36,8 +36,8 @@ func init() {
 
 		fmt.Fprintln(w, "\nExamples:")
 		fmt.Fprintln(w, "  sniffl -H smtp.example.com:587 smtp")
-		fmt.Fprintln(w, "  sniffl -H www.example.com:443 http --export=bundle")
-		fmt.Fprintln(w, "  sniffl -F targets.txt --export=full_bundle --exportdns=all_dns.txt")
+		fmt.Fprintln(w, "  sniffl -H www.example.com:443 http -export bundle")
+		fmt.Fprintln(w, "  sniffl -F targets.txt -export full_bundle -exportdns all_dns.txt")
 
 		// Trailing newline for a clean prompt return.
 		fmt.Fprintln(w)

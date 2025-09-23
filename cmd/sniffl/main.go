@@ -34,7 +34,7 @@ func main() {
 	flag.StringVar(&httpsProxy, "https_proxy", "", "HTTP proxy URL")
 	flag.BoolVar(&verbose, "v", false, "verbose")
 	flag.BoolVar(&verbose, "verbose", false, "verbose")
-	
+
 	// Custom flag parsing to handle flags that appear after positional arguments
 	parseFlags()
 
@@ -118,7 +118,7 @@ func parseFlags() {
 	args := os.Args[1:]
 	flagArgs := []string{}
 	nonFlagArgs := []string{}
-	
+
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if strings.HasPrefix(arg, "-") {
@@ -132,11 +132,11 @@ func parseFlags() {
 			nonFlagArgs = append(nonFlagArgs, arg)
 		}
 	}
-	
+
 	// Create a new argument list with flags first, then non-flag arguments
 	newArgs := append(flagArgs, nonFlagArgs...)
 	os.Args = append([]string{os.Args[0]}, newArgs...)
-	
+
 	// Now parse flags normally
 	flag.Parse()
 }
