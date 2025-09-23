@@ -114,8 +114,16 @@ func fatalUsage(msg string) {
 
 // parseFlags parses command line flags regardless of their position
 func parseFlags() {
-	// First, collect all flags and their values
+	// Check for help flags first, before any rearrangement
 	args := os.Args[1:]
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" || arg == "-help" {
+			flag.Usage()
+			os.Exit(0)
+		}
+	}
+
+	// First, collect all flags and their values
 	flagArgs := []string{}
 	nonFlagArgs := []string{}
 
