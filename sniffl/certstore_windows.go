@@ -69,8 +69,18 @@ func (a *App) getWindowsCertStoreRoots() ([]*x509.Certificate, error) {
 		}
 	}
 
-	fetch(windows.CERT_SYSTEM_STORE_LOCAL_MACHINE, syscall.StringToUTF16Ptr(localMachineStoreName))
-	fetch(windows.CERT_SYSTEM_STORE_CURRENT_USER, syscall.StringToUTF16Ptr(currentUserStoreName))
+	ptr, err := syscall.UTF16PtrFromString(localMachineStoreName)
+	if err != nil {
+		a.debugf("Failed to convert localMachineStoreName to UTF16: %v", err)
+		return nil, err
+	}
+	fetch(windows.CERT_SYSTEM_STORE_LOCAL_MACHINE, ptr)
+	ptr, err = syscall.UTF16PtrFromString(currentUserStoreName)
+	if err != nil {
+		a.debugf("Failed to convert currentUserStoreName to UTF16: %v", err)
+		return nil, err
+	}
+	fetch(windows.CERT_SYSTEM_STORE_CURRENT_USER, ptr)
 	return certs, nil
 }
 

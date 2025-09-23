@@ -29,13 +29,13 @@ Clone the repository and build the binary with Go:
 ```bash
 git clone https://github.com/lesydimitri/sniffl.git
 cd sniffl
-go build ./cmd/sniffl
+go build -o dist/sniffl ./cmd/sniffl
 ```
 
 *Note:* For Windows cross-compilation on other platforms, use:
 
 ```bash
-GOOS=windows GOARCH=amd64 go build ./cmd/sniffl
+GOOS=windows GOARCH=amd64 go build -o dist/sniffl.exe ./cmd/sniffl
 ```
 
 ## Usage
