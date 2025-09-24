@@ -1,5 +1,4 @@
-// sniffl/ca_bundle.go
-package sniffl
+package check
 
 import (
 	"context"
@@ -20,14 +19,14 @@ func (a *App) fetchAndAppendCABundle(ctx context.Context, certs *[]*x509.Certifi
 		if winRoots, err := a.getWindowsCertStoreRoots(); err == nil {
 			*certs = append(*certs, winRoots...)
 		} else {
-			a.debugf("Failed to load Windows cert store: %v", err)
+			a.logger.Debug("Failed to load Windows cert store", "error", err)
 		}
 	}
 	if isDarwin() {
 		if macRoots, err := a.getMacOSCertStoreRoots(); err == nil {
 			*certs = append(*certs, macRoots...)
 		} else {
-			a.debugf("Failed to load macOS cert store: %v", err)
+			a.logger.Debug("Failed to load macOS cert store", "error", err)
 		}
 	}
 	path, err := a.ensureCABundle(ctx)
@@ -45,13 +44,14 @@ func (a *App) fetchAndAppendCABundle(ctx context.Context, certs *[]*x509.Certifi
 func (a *App) ensureCABundle(ctx context.Context) (string, error) {
 	// If a local bundle path is supplied, use it verbatim.
 	if a.cfg.TrustedCABundle != "" {
+		a.logger.Debug("Using provided CA bundle path", "path", a.cfg.TrustedCABundle)
 		return a.cfg.TrustedCABundle, nil
 	}
 
 	// Resolve cache directory, using injected override if present.
 	dir, err := a.cacheDir()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to determine cache directory: %w", err)
 	}
 	dest := filepath.Join(dir, "cacert.pem")
 	etagPath := filepath.Join(dir, "cacert.etag")
@@ -61,6 +61,7 @@ func (a *App) ensureCABundle(ctx context.Context) (string, error) {
 	data, readErr := os.ReadFile(etagPath)
 	if readErr == nil {
 		etag = string(data)
+		a.logger.Debug("Found existing ETag for CA bundle", "etag", etag)
 	}
 
 	// Choose URL: injected override or the default curl CA bundle.
@@ -68,9 +69,13 @@ func (a *App) ensureCABundle(ctx context.Context) (string, error) {
 	if a.cfg.CABundleURL != "" {
 		url = a.cfg.CABundleURL
 	}
+	a.logger.Debug("Fetching CA bundle", "url", url)
 
 	// Build request with conditional header.
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create HTTP request for CA bundle: %w", err)
+	}
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
 	}
@@ -78,28 +83,40 @@ func (a *App) ensureCABundle(ctx context.Context) (string, error) {
 	// Use injected client for testability.
 	resp, err := a.cfg.HTTPClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("CA bundle fetch error: %w", err)
+		return "", fmt.Errorf("failed to fetch CA bundle from %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			a.logger.Debug("Warning: failed to close response body", "error", err)
+		}
+	}()
 
 	switch resp.StatusCode {
 	case http.StatusOK:
+		a.logger.Debug("Downloading new CA bundle", "destination", dest)
 		// Write new bundle via injected file creator.
 		f, err := a.cfg.FileCreator(dest)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to create CA bundle file %s: %w", dest, err)
 		}
-		defer f.Close()
+		defer func() {
+			if err := f.Close(); err != nil {
+				a.logger.Debug("Warning: failed to close CA bundle file", "error", err)
+			}
+		}()
 		if _, err := io.Copy(f, resp.Body); err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to download CA bundle to %s: %w", dest, err)
 		}
 		if newEtag := resp.Header.Get("ETag"); newEtag != "" {
-			_ = os.WriteFile(etagPath, []byte(newEtag), 0o644)
+			if err := os.WriteFile(etagPath, []byte(newEtag), 0o644); err != nil {
+				a.logger.Debug("Warning: failed to save ETag", "path", etagPath, "error", err)
+			}
 		}
 	case http.StatusNotModified:
+		a.logger.Debug("CA bundle is up to date (304 Not Modified)")
 		// Keep existing file; nothing to do.
 	default:
-		return "", fmt.Errorf("unexpected CA bundle status: %s", resp.Status)
+		return "", fmt.Errorf("unexpected HTTP status when fetching CA bundle: %s", resp.Status)
 	}
 	return dest, nil
 }
@@ -133,7 +150,7 @@ func (a *App) cacheDir() (string, error) {
 	if a.cfg.CacheDir != nil {
 		return a.cfg.CacheDir()
 	}
-	// default per-OS path creation (unchanged)
+	// Default per-OS path.
 	var dir string
 	switch runtime.GOOS {
 	case "windows":

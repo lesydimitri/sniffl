@@ -30,7 +30,7 @@ jobs:
         run: |
           mkdir -p dist
           OUT="sniffl-${GOOS}-${GOARCH}"
-          go build -ldflags "-X main.toolVersion=${VERSION}" -o "dist/${OUT}" ./cmd/sniffl
+          go build -ldflags "-X github.com/lesydimitri/sniffl/cmd/sniffl/cmd.version=${VERSION}" -o "dist/${OUT}" ./cmd/sniffl
       - name: 📦 Upload asset (${{ matrix.os }}-${{ matrix.arch }})
         uses: softprops/action-gh-release@v2
         with:
@@ -61,7 +61,7 @@ jobs:
         run: |
           mkdir -p dist
           OUT="sniffl-windows-${GOARCH}.exe"
-          go build -ldflags "-X main.toolVersion=${VERSION}" -o "dist/${OUT}" ./cmd/sniffl
+          go build -ldflags "-X github.com/lesydimitri/sniffl/cmd/sniffl/cmd.version=${VERSION}" -o "dist/${OUT}" ./cmd/sniffl
       - name: 📦 Upload asset (windows-${{ matrix.arch }})
         uses: softprops/action-gh-release@v2
         with:
@@ -92,7 +92,7 @@ jobs:
           mkdir -p dist
           OUT="sniffl-darwin-${GOARCH}"
           # SDK is available on macOS runners; cgo picks up -framework Security from source.
-          go build -ldflags "-X main.toolVersion=${VERSION}" -o "dist/${OUT}" ./cmd/sniffl
+          go build -ldflags "-X github.com/lesydimitri/sniffl/cmd/sniffl/cmd.version=${VERSION}" -o "dist/${OUT}" ./cmd/sniffl
       - name: 📦 Upload asset (darwin-${{ matrix.arch }})
         uses: softprops/action-gh-release@v2
         with:

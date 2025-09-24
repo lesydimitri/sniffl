@@ -1,6 +1,6 @@
 //go:build !windows && !darwin
 
-package sniffl
+package check
 
 import (
 	"crypto/x509"

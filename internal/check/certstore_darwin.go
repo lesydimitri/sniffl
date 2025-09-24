@@ -1,7 +1,6 @@
-// sniffl/certstore_darwin.go
 //go:build darwin
 
-package sniffl
+package check
 
 /*
 #cgo LDFLAGS: -framework Security
@@ -17,7 +16,7 @@ import (
 	"unsafe"
 )
 
-// Now a method on *App so we can use a.debugf.
+// Method on *App to allow using a.debugf.
 func (a *App) getMacOSCertStoreRoots() ([]*x509.Certificate, error) {
 	var certs []*x509.Certificate
 	var anchorCerts C.CFArrayRef
@@ -45,16 +44,16 @@ func (a *App) getMacOSCertStoreRoots() ([]*x509.Certificate, error) {
 
 		cert, err := x509.ParseCertificate(der)
 		if err != nil {
-			a.debugf("Failed to parse macOS root certificate at index %d: %v", i, err)
+			a.logger.Debug("Failed to parse macOS root certificate", "index", i, "error", err)
 			continue
 		}
-		a.debugf("Processed macOS system root certificate at index %d:\n%s", i, certificateSummary(cert))
+		a.logger.Debug("Processed macOS system root certificate", "index", i, "subject", cert.Subject.String())
 		certs = append(certs, cert)
 	}
 	return certs, nil
 }
 
-// Stub so non-darwin builds still compile.
+// Stub for non-darwin builds.
 func (a *App) getWindowsCertStoreRoots() ([]*x509.Certificate, error) {
 	return nil, fmt.Errorf("getWindowsCertStoreRoots is not implemented on this platform")
 }
