@@ -37,10 +37,9 @@ go build -o dist/sniffl ./cmd/sniffl
 
 > [!NOTE]
 > To cross-compile sniffl for Windows from other platforms, use:
-
-```bash
-GOOS=windows GOARCH=amd64 go build -o dist/sniffl.exe ./cmd/sniffl
-```
+> ```bash
+> GOOS=windows GOARCH=amd64 go build -o dist/sniffl.exe ./cmd/sniffl
+> ```
 
 ## Usage
 
