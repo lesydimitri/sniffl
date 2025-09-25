@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -43,13 +44,13 @@ func (a *App) fetchCertsByProtocol(ctx context.Context, protocol, host, port, ho
 func (a *App) fetchTLS(ctx context.Context, host, port string) ([]*x509.Certificate, error) {
 	addr := net.JoinHostPort(host, port)
 	a.logger.Network("Establishing TCP connection", "address", addr)
-	
+
 	c, err := a.dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		a.logger.Network("TCP connection failed", "address", addr, "error", err)
 		return nil, fmt.Errorf("failed to establish TCP connection to %s: %w", addr, err)
 	}
-	
+
 	a.logger.TLS("Starting TLS handshake", "server_name", host)
 	tconn := a.tlsFactory.Client(c, &tls.Config{ServerName: host, InsecureSkipVerify: true})
 	if err := tconn.HandshakeContext(ctx); err != nil {
@@ -64,7 +65,7 @@ func (a *App) fetchTLS(ctx context.Context, host, port string) ([]*x509.Certific
 			a.logger.TLS("Warning: failed to close TLS connection", "error", err)
 		}
 	}()
-	
+
 	certs := tconn.ConnectionState().PeerCertificates
 	a.logger.TLS("TLS handshake successful", "server_name", host, "certificates", len(certs))
 	return certs, nil
@@ -75,7 +76,7 @@ type initFunc func(*bufio.Writer, *bufio.Reader) error
 func (a *App) fetchTLSOverProtocol(ctx context.Context, host, port string, init initFunc) ([]*x509.Certificate, error) {
 	addr := net.JoinHostPort(host, port)
 	a.logger.Network("Establishing TCP connection for STARTTLS", "address", addr)
-	
+
 	conn, err := a.dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to establish TCP connection to %s: %w", addr, err)
@@ -114,11 +115,11 @@ func (a *App) fetchTLSOverHTTP(ctx context.Context, host, port string) ([]*x509.
 // establishHTTPConnection creates a connection to the target, either directly or via proxy
 func (a *App) establishHTTPConnection(ctx context.Context, host, port string) (net.Conn, error) {
 	addr := net.JoinHostPort(host, port)
-	
+
 	if a.cfg.HTTPSProxy != nil {
 		return a.connectViaProxy(ctx, addr)
 	}
-	
+
 	conn, err := a.dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect directly to %s: %w", addr, err)
@@ -132,13 +133,13 @@ func (a *App) connectViaProxy(ctx context.Context, targetAddr string) (net.Conn,
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve proxy address: %w", err)
 	}
-	
+
 	// Connect to proxy
 	conn, err := a.dialer.DialContext(ctx, "tcp", proxyHostPort)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to proxy %s: %w", proxyHostPort, err)
 	}
-	
+
 	// Wrap in TLS if HTTPS proxy
 	if strings.EqualFold(a.cfg.HTTPSProxy.Scheme, "https") {
 		conn, err = a.wrapProxyConnectionInTLS(ctx, conn)
@@ -149,7 +150,7 @@ func (a *App) connectViaProxy(ctx context.Context, targetAddr string) (net.Conn,
 			return nil, fmt.Errorf("failed to establish TLS connection to HTTPS proxy: %w", err)
 		}
 	}
-	
+
 	// Send CONNECT request
 	if err := a.sendCONNECTRequest(conn, targetAddr); err != nil {
 		if closeErr := conn.Close(); closeErr != nil {
@@ -157,7 +158,7 @@ func (a *App) connectViaProxy(ctx context.Context, targetAddr string) (net.Conn,
 		}
 		return nil, fmt.Errorf("CONNECT request failed for target %s: %w", targetAddr, err)
 	}
-	
+
 	return conn, nil
 }
 
@@ -165,7 +166,7 @@ func (a *App) connectViaProxy(ctx context.Context, targetAddr string) (net.Conn,
 func (a *App) resolveProxyAddress() (string, error) {
 	proxyHostPort := a.cfg.HTTPSProxy.Host
 	proxyScheme := a.cfg.HTTPSProxy.Scheme
-	
+
 	// If no port provided, choose default based on scheme
 	if _, _, err := net.SplitHostPort(proxyHostPort); err != nil {
 		defaultPort := DefaultHTTPPort
@@ -174,7 +175,7 @@ func (a *App) resolveProxyAddress() (string, error) {
 		}
 		proxyHostPort = net.JoinHostPort(proxyHostPort, defaultPort)
 	}
-	
+
 	return proxyHostPort, nil
 }
 
@@ -185,17 +186,17 @@ func (a *App) wrapProxyConnectionInTLS(ctx context.Context, conn net.Conn) (net.
 	if h, _, err := net.SplitHostPort(sni); err == nil {
 		sni = h
 	}
-	
+
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         sni,
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true,
 	})
-	
+
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("TLS handshake to HTTPS proxy %s failed: %w", sni, err)
 	}
-	
+
 	return tlsConn, nil
 }
 
@@ -205,7 +206,7 @@ func (a *App) sendCONNECTRequest(conn net.Conn, targetAddr string) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "CONNECT %s HTTP/1.1\r\n", targetAddr)
 	fmt.Fprintf(&b, "Host: %s\r\n", targetAddr)
-	
+
 	// Add proxy authentication if configured
 	if a.cfg.HTTPSProxy.User != nil {
 		user := a.cfg.HTTPSProxy.User.Username()
@@ -214,12 +215,12 @@ func (a *App) sendCONNECTRequest(conn net.Conn, targetAddr string) error {
 		fmt.Fprintf(&b, "Proxy-Authorization: Basic %s\r\n", b64)
 	}
 	b.WriteString("\r\n")
-	
+
 	// Send request
 	if _, err := conn.Write([]byte(b.String())); err != nil {
 		return fmt.Errorf("failed to write CONNECT request: %w", err)
 	}
-	
+
 	// Read and validate response
 	return a.validateCONNECTResponse(conn)
 }
@@ -227,17 +228,24 @@ func (a *App) sendCONNECTRequest(conn net.Conn, targetAddr string) error {
 // validateCONNECTResponse reads and validates the proxy's CONNECT response
 func (a *App) validateCONNECTResponse(conn net.Conn) error {
 	br := bufio.NewReader(conn)
-	
+
 	// Read status line
 	statusLine, err := br.ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("failed to read CONNECT response status: %w", err)
 	}
-	
-	if !strings.Contains(statusLine, HTTPStatusOK) {
-		return fmt.Errorf("proxy CONNECT failed with status: %s", strings.TrimSpace(statusLine))
+
+	// Parse HTTP status line: HTTP/1.1 200 Connection Established
+	line := strings.TrimSpace(statusLine)
+	parts := strings.Fields(line)
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "HTTP/") {
+		return fmt.Errorf("invalid proxy CONNECT status line: %s", line)
 	}
-	
+	code, convErr := strconv.Atoi(parts[1])
+	if convErr != nil || code != 200 {
+		return fmt.Errorf("proxy CONNECT failed with status: %s", line)
+	}
+
 	// Read headers until empty line
 	for {
 		line, err := br.ReadString('\n')
@@ -248,7 +256,7 @@ func (a *App) validateCONNECTResponse(conn net.Conn) error {
 			break
 		}
 	}
-	
+
 	return nil
 }
 
@@ -258,7 +266,7 @@ func (a *App) performTLSHandshake(ctx context.Context, conn net.Conn, serverName
 		ServerName:         serverName,
 		InsecureSkipVerify: true,
 	})
-	
+
 	if err := tconn.HandshakeContext(ctx); err != nil {
 		if closeErr := tconn.Close(); closeErr != nil {
 			a.logger.TLS("Warning: failed to close TLS connection", "error", closeErr)
@@ -270,7 +278,7 @@ func (a *App) performTLSHandshake(ctx context.Context, conn net.Conn, serverName
 			a.logger.TLS("Warning: failed to close TLS connection", "error", err)
 		}
 	}()
-	
+
 	return tconn.ConnectionState().PeerCertificates, nil
 }
 

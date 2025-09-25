@@ -19,6 +19,11 @@
 - Exports system-trusted certificate authorities from both macOS and Windows stores for root CA inclusion
 - Protocol guessing based on common ports if not explicitly specified
 
+### 📸 **Screenshot Capture**
+- **Visual reconnaissance**: Capture screenshots of HTTP/HTTPS services
+- **Multiple input methods**: Single URLs, host:port, file lists, or CIDR ranges
+- **SSL handling**: Ignores certificate errors by default for reconnaissance
+
 ## Installation
 
 ### Option 1: Download a Precompiled Binary
@@ -41,37 +46,9 @@ go build -o dist/sniffl ./cmd/sniffl
 > GOOS=windows GOARCH=amd64 go build -o dist/sniffl.exe ./cmd/sniffl
 > ```
 
-## Usage
-
-sniffl uses a subcommand-based interface with comprehensive help and validation:
-
-```bash
-# Check certificates from live servers
-sniffl check <host:port>           # Single host
-sniffl check --file <targets.txt>  # Multiple hosts from file
-
-# Query Certificate Transparency logs
-sniffl ct <domain>                 # Query CT logs for domain
-# Configuration management
-sniffl config init                 # Create default config file
-sniffl config show                 # Show current configuration
-sniffl config example              # Show example configuration
-
-# Documentation generation
-sniffl man                         # Generate man pages
-sniffl man --format markdown       # Generate markdown docs
-
-# Shell completion
-sniffl completion bash             # Generate bash completion
-sniffl completion zsh              # Generate zsh completion
-
-# Get help for any command
-sniffl --help
-sniffl check --help
-sniffl ct --help
-```
-
 ## Commands
+
+sniffl uses a subcommand-based interface. Use `--help` with any command for details.
 
 ### `sniffl check` - Certificate Checking
 
@@ -161,6 +138,33 @@ sniffl man --generate --output /usr/local/share/man  # Generate in custom locati
 - Use `--show-expired` to include expired certificates in results
 - Discovered domains are automatically filtered to include only relevant subdomains
 
+### `sniffl screenshot` - Web Screenshot Capture
+
+Capture screenshots of HTTP/HTTPS services for visual reconnaissance.
+
+**Options:**
+
+- `-f, --file <file>`         File with targets (URLs or host:port)
+- `--cidr <range>`           CIDR range to scan (e.g., 192.168.1.0/24)
+- `-o, --output-dir <dir>`   Output directory for screenshots (default: screenshots)
+- `-p, --ports <ports>`      Comma-separated ports for CIDR scan (default: 80,443,8080,8443)
+- `-c, --concurrency <n>`    Concurrent operations (default: 5)
+- `--timeout <duration>`     Screenshot timeout (default: 30s)
+- `--ignore-ssl-errors`      Ignore SSL certificate errors (default: true)
+- `--skip-port-check`        Skip initial port connectivity check
+- `--chrome-path <path>`     Path to Chrome/Chromium executable
+- `--auto-download`          Auto-download Chromium if not found (default: true)
+- `--dry-run`                Show what would be done without executing
+
+**Requirements:**
+- Chrome or Chromium (auto-downloaded if not found)
+
+**Input Methods:**
+- Single URL: `https://example.com`
+- Host:port: `example.com:8080` (auto-detects HTTP/HTTPS)
+- File: List of URLs or host:port entries
+- CIDR: Network range scanning
+
 ## Examples
 
 ### Certificate Checking
@@ -221,6 +225,32 @@ Preview CT query with dry-run:
 sniffl ct example.com --dry-run
 ```
 
+### Screenshot Capture
+
+Capture screenshot of a single website:
+
+```bash
+sniffl screenshot https://example.com
+```
+
+Scan a network range for web services:
+
+```bash
+sniffl screenshot --cidr 192.168.1.0/24
+```
+
+Capture screenshots from a file list:
+
+```bash
+sniffl screenshot --file targets.txt --output-dir ./screenshots
+```
+
+High-speed scanning with custom settings:
+
+```bash
+sniffl screenshot --cidr 10.0.0.0/24 --concurrency 10 --timeout 15s
+```
+
 ### Configuration Management
 
 Create a configuration file with defaults:
@@ -271,13 +301,23 @@ export_dir: .
 retry_attempts: 5
 retry_delay: 1s
 ct_show_expired: false
+
+# Screenshot settings
+screenshot_output_dir: "screenshots"
+screenshot_timeout: "30s"
+screenshot_concurrency: 5
+screenshot_ignore_ssl_errors: true
+screenshot_auto_download: true
+
 log_level: info
 log_format: text
 ```
 
-## File Format
+## File Formats
 
-When using `sniffl check --file <targets.txt>` or `sniffl check -f <targets.txt>`, each line should contain:
+### Certificate Checking
+
+When using `sniffl check --file <targets.txt>`, each line should contain:
 
 ```
 host:port [protocol]
@@ -289,6 +329,22 @@ smtp.gmail.com:587 smtp
 imap.gmail.com:993 imap
 example.com:443
 pop.gmail.com:995 pop3
+```
+
+### Screenshot Capture
+
+When using `sniffl screenshot --file <targets.txt>`, each line should contain:
+
+```
+URL or host:port
+```
+
+**Examples:**
+```
+https://example.com
+http://internal.company.com:8080
+example.com:443
+192.168.1.100:80
 ```
 
 ## Logging

@@ -30,6 +30,7 @@ Supports the standard Unix convention of separate man pages for each subcommand.
   sniffl man check
   sniffl man ct
   sniffl man config
+  sniffl man screenshot
   
   # Generate documentation files for distribution
   sniffl man --generate
@@ -100,7 +101,7 @@ func showManPage(args []string) error {
 	commandName := "sniffl"
 	if len(args) > 0 {
 		switch args[0] {
-		case "check", "ct", "config", "man", "completion":
+		case "check", "ct", "config", "man", "completion", "screenshot":
 			commandName = "sniffl-" + args[0]
 		default:
 			return errors.NewValidationError(fmt.Sprintf("unknown command: %s", args[0]))
@@ -290,10 +291,11 @@ To make all sniffl man pages available system-wide for all users, you can:
    export MANPATH="$HOME/.local/share/man:$MANPATH"
 
 After installation, you can use:
-   man sniffl        # Main command
-   man sniffl-check  # Certificate checking
-   man sniffl-ct     # Certificate Transparency
-   man sniffl-config # Configuration management
+   man sniffl           # Main command
+   man sniffl-check     # Certificate checking
+   man sniffl-ct        # Certificate Transparency
+   man sniffl-config    # Configuration management
+   man sniffl-screenshot # Web screenshot capture
 
 `, manDir)
 }

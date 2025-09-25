@@ -52,7 +52,7 @@ Transparency logs to discover all issued certificates for a domain.`,
 		// Set log level based on verbose flag
 		logLevel := cfg.LogLevel
 		if cfg.Verbose {
-			logLevel = "info" // Show info and debug when verbose
+			logLevel = "debug" // Enable debug-level logs when verbose for maximum detail
 		}
 
 		// Initialize logger
@@ -93,6 +93,7 @@ func init() {
 	// Add subcommands
 	rootCmd.AddCommand(checkCmd)
 	rootCmd.AddCommand(ctCmd)
+	rootCmd.AddCommand(screenshotCmd)
 	rootCmd.AddCommand(configCmd)
 	rootCmd.AddCommand(manCmd)
 }
