@@ -3,9 +3,12 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/lesydimitri/sniffl/internal/config"
 	"github.com/lesydimitri/sniffl/internal/logging"
@@ -23,6 +26,7 @@ var (
 	logger     *logging.Logger
 	rootCtx    context.Context
 	cancelFunc context.CancelFunc
+	logFile    *os.File
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -36,32 +40,38 @@ and export TLS certificates from remote servers using multiple protocols includi
 SMTP, IMAP, POP3, or plain TLS connection. It also supports querying Certificate 
 Transparency logs to discover all issued certificates for a domain.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		// Load configuration
 		var err error
-		cfg, err = config.LoadConfig(cfgFile)
+		// Check if config flag was explicitly set
+		explicitConfig := cmd.PersistentFlags().Changed("config")
+		cfg, err = config.LoadConfigWithExplicitFlag(cfgFile, explicitConfig)
 		if err != nil {
 			return fmt.Errorf("failed to load config: %w", err)
 		}
 
-		// Override config with command line flags
 		if cmd.Flags().Changed("verbose") {
 			verbose, _ := cmd.Flags().GetBool("verbose")
 			cfg.Verbose = verbose
 		}
 
-		// Set log level based on verbose flag
 		logLevel := cfg.LogLevel
 		if cfg.Verbose {
-			logLevel = "debug" // Enable debug-level logs when verbose for maximum detail
+			logLevel = "debug"
 		}
 
-		// Initialize logger
-		logger = logging.New(logLevel, cfg.LogFormat, os.Stderr)
-
-		// Create context with cancellation
+		var logOut io.Writer = os.Stderr
+		if cfg.ExportDir != "" && cfg.ExportDir != "." {
+			logDir := filepath.Join(cfg.ExportDir, "logs")
+			if err := os.MkdirAll(logDir, cfg.OutputDirPermissions); err == nil {
+				ts := getTimestamp()
+				path := filepath.Join(logDir, fmt.Sprintf("%s_sniffl.log", ts))
+				if f, e := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, cfg.OutputFilePermissions); e == nil {
+					logOut = f
+					logFile = f
+				}
+			}
+		}
+		logger = logging.New(logLevel, cfg.LogFormat, logOut)
 		rootCtx, cancelFunc = context.WithCancel(context.Background())
-
-		// Handle interrupt signals gracefully
 		go func() {
 			sigChan := make(chan os.Signal, 1)
 			signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -77,20 +87,27 @@ Transparency logs to discover all issued certificates for a domain.`,
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
+	defer func() {
 		if cancelFunc != nil {
 			cancelFunc()
 		}
+		if logFile != nil {
+			if err := logFile.Close(); err != nil {
+				// Log to stderr since our logger might be using this file
+				fmt.Fprintf(os.Stderr, "Warning: failed to close log file: %v\n", err)
+			}
+		}
+	}()
+	
+	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
 func init() {
-	// Global flags
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.sniffl.yaml)")
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "verbose output")
 
-	// Add subcommands
 	rootCmd.AddCommand(checkCmd)
 	rootCmd.AddCommand(ctCmd)
 	rootCmd.AddCommand(screenshotCmd)
@@ -98,25 +115,36 @@ func init() {
 	rootCmd.AddCommand(manCmd)
 }
 
-// getVersion returns the application version
-// Set at build time
 var version = "dev"
 
 func getVersion() string {
 	return version
 }
 
+func getTimestamp() string {
+	return time.Now().UTC().Format("20060102_150405")
+}
+
 // GetContext returns the root context
 func GetContext() context.Context {
+	if rootCtx == nil {
+		return context.Background()
+	}
 	return rootCtx
 }
 
 // GetConfig returns the loaded configuration
 func GetConfig() *config.Config {
+	if cfg == nil {
+		return config.DefaultConfig()
+	}
 	return cfg
 }
 
 // GetLogger returns the configured logger
 func GetLogger() *logging.Logger {
+	if logger == nil {
+		return logging.New("warn", "text", os.Stderr)
+	}
 	return logger
 }

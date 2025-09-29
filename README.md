@@ -22,7 +22,6 @@
 ### 📸 **Screenshot Capture**
 - **Visual reconnaissance**: Capture screenshots of HTTP/HTTPS services
 - **Multiple input methods**: Single URLs, host:port, file lists, or CIDR ranges
-- **SSL handling**: Ignores certificate errors by default for reconnaissance
 
 ## Installation
 
@@ -59,7 +58,7 @@ Check certificates from live servers using various protocols.
 - `-f, --file <file>`         File with targets (host:port [protocol])
 - `-p, --protocol <proto>`    Connection protocol (smtp|imap|pop3|http|none, auto-detected if omitted)
 - `-e, --export <mode>`       Export certificates (single|bundle|full_bundle)
-- `--export-dns <file>`       File to write DNS names
+- `--export-dns`              Export DNS names to `EXPORT_DIR/dns/<timestamp>_<host_or_list>_dns.txt`
 - `--https-proxy <url>`       HTTP proxy URL
 - `--dry-run`                 Show what would be done without executing
 
@@ -83,7 +82,7 @@ Query Certificate Transparency logs to discover all issued certificates for a do
 **Options:**
 
 - `--show-expired`      Show expired certificates in CT results
-- `--export-dns <file>` File to write discovered DNS names
+- `--export-dns`        Export discovered DNS names to `EXPORT_DIR/dns/<timestamp>_<domain>_dns.txt`
 - `--dry-run`           Show what would be done without executing
 - `--verbose`           Verbose output
 
@@ -184,7 +183,7 @@ sniffl check imap.mail.yahoo.com:143 --protocol imap --export full_bundle
 Scan multiple targets from a file:
 
 ```bash
-sniffl check --file targets.txt --export bundle --export-dns all_domains.txt
+sniffl check --file targets.txt --export bundle --export-dns
 ```
 
 Use an HTTP proxy:
@@ -216,7 +215,7 @@ sniffl ct example.com
 Query CT logs with expired certificates and export domains:
 
 ```bash
-sniffl ct github.com --show-expired --export-dns domains.txt
+sniffl ct github.com --show-expired --export-dns
 ```
 
 Preview CT query with dry-run:
@@ -311,6 +310,10 @@ screenshot_auto_download: true
 
 log_level: info
 log_format: text
+
+# Output permissions
+output_dir_permissions: 700
+output_file_permissions: 600
 ```
 
 ## File Formats

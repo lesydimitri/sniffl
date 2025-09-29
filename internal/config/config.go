@@ -1,33 +1,25 @@
-// Package config provides configuration management for sniffl
 package config
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Default configuration values
 const (
-	// DefaultTimeout is the default timeout for network operations
-	DefaultTimeout = 30 * time.Second
-	// DefaultConcurrency is the default number of concurrent operations
-	DefaultConcurrency = 5
-	// DefaultRetryAttempts is the default number of retry attempts
+	DefaultTimeout       = 30 * time.Second
+	DefaultConcurrency   = 5
 	DefaultRetryAttempts = 3
-	// DefaultRetryDelay is the default delay between retries
-	DefaultRetryDelay = time.Second
+	DefaultRetryDelay    = time.Second
 )
 
-// File permission constants
 const (
-	// DirPermissions are the permissions for created directories
-	DirPermissions = 0755
-	// FilePermissions are the permissions for created files
-	FilePermissions = 0644
+	DirPermissions  = 0o700
+	FilePermissions = 0o600
 )
 
 // Config represents the application configuration
@@ -60,7 +52,6 @@ type Config struct {
 	ScreenshotWaitTime      time.Duration `yaml:"screenshot_wait_time"`
 	ScreenshotUserAgent     string        `yaml:"screenshot_user_agent"`
 	ScreenshotConcurrency   int           `yaml:"screenshot_concurrency"`
-	ScreenshotAutoDownload  bool          `yaml:"screenshot_auto_download"`
 	ScreenshotChromePath    string        `yaml:"screenshot_chrome_path"`
 	ScreenshotSkipPortCheck bool          `yaml:"screenshot_skip_port_check"`
 	ScreenshotIgnoreSSL     bool          `yaml:"screenshot_ignore_ssl_errors"`
@@ -68,6 +59,10 @@ type Config struct {
 	// Logging settings
 	LogLevel  string `yaml:"log_level"`  // debug, info, warn, error
 	LogFormat string `yaml:"log_format"` // text, json
+
+	// Output permissions (override defaults if needed)
+	OutputDirPermissions  os.FileMode `yaml:"output_dir_permissions"`
+	OutputFilePermissions os.FileMode `yaml:"output_file_permissions"`
 }
 
 // DefaultConfig returns a configuration with sensible defaults
@@ -89,22 +84,34 @@ func DefaultConfig() *Config {
 		ScreenshotWaitTime:      2 * time.Second,
 		ScreenshotUserAgent:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 		ScreenshotConcurrency:   5,
-		ScreenshotAutoDownload:  true,
 		ScreenshotChromePath:    "",
 		ScreenshotSkipPortCheck: false,
 		ScreenshotIgnoreSSL:     true, // Default to true for network reconnaissance
 		LogLevel:                "warn",
 		LogFormat:               "text",
+		OutputDirPermissions:    DirPermissions,
+		OutputFilePermissions:   FilePermissions,
 	}
 }
 
 // LoadConfig loads configuration from file, falling back to defaults
+// It searches for config files in standard locations and merges with defaults
 func LoadConfig(configPath string) (*Config, error) {
+	return LoadConfigWithExplicitFlag(configPath, false)
+}
+
+// LoadConfigWithExplicitFlag loads configuration with a flag indicating if the path was explicitly provided
+func LoadConfigWithExplicitFlag(configPath string, explicit bool) (*Config, error) {
 	config := DefaultConfig()
 
 	// If no config path specified, try default locations
 	if configPath == "" {
 		configPath = findConfigFile()
+	}
+
+	// If config file was explicitly specified but doesn't exist, return error
+	if configPath != "" && !fileExists(configPath) && explicit {
+		return nil, fmt.Errorf("failed to load config: config file not found: %s", configPath)
 	}
 
 	// If config file exists, load it
@@ -149,14 +156,53 @@ func findConfigFile() string {
 		".sniffl.yml",
 	}
 
-	// Check home directory
+	// Add OS-specific config locations
 	if home, err := os.UserHomeDir(); err == nil {
+		// Always check home directory for dotfiles
 		locations = append(locations,
 			filepath.Join(home, ".sniffl.yaml"),
 			filepath.Join(home, ".sniffl.yml"),
-			filepath.Join(home, ".config", "sniffl", "config.yaml"),
-			filepath.Join(home, ".config", "sniffl", "config.yml"),
 		)
+		
+		// Add OS-specific standard config locations
+		switch runtime.GOOS {
+		case "windows":
+			// Windows: %APPDATA%\sniffl\config.yaml
+			if appData := os.Getenv("APPDATA"); appData != "" {
+				locations = append(locations,
+					filepath.Join(appData, "sniffl", "config.yaml"),
+					filepath.Join(appData, "sniffl", "config.yml"),
+				)
+			} else {
+				// Fallback to user profile
+				locations = append(locations,
+					filepath.Join(home, "AppData", "Roaming", "sniffl", "config.yaml"),
+					filepath.Join(home, "AppData", "Roaming", "sniffl", "config.yml"),
+				)
+			}
+			
+		case "darwin":
+			// macOS: ~/Library/Preferences/sniffl/config.yaml
+			locations = append(locations,
+				filepath.Join(home, "Library", "Preferences", "sniffl", "config.yaml"),
+				filepath.Join(home, "Library", "Preferences", "sniffl", "config.yml"),
+			)
+			
+		default:
+			// Linux/Unix: Follow XDG Base Directory specification
+			// XDG_CONFIG_HOME or ~/.config/sniffl/config.yaml
+			if xdgConfig := os.Getenv("XDG_CONFIG_HOME"); xdgConfig != "" {
+				locations = append(locations,
+					filepath.Join(xdgConfig, "sniffl", "config.yaml"),
+					filepath.Join(xdgConfig, "sniffl", "config.yml"),
+				)
+			} else {
+				locations = append(locations,
+					filepath.Join(home, ".config", "sniffl", "config.yaml"),
+					filepath.Join(home, ".config", "sniffl", "config.yml"),
+				)
+			}
+		}
 	}
 
 	for _, path := range locations {

@@ -3,17 +3,23 @@ package check
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestEnsureCABundle_DownloadAndCache verifies the complete CA bundle caching workflow:
@@ -23,23 +29,24 @@ import (
 func TestEnsureCABundle_DownloadAndCache(t *testing.T) {
 	t.Parallel()
 
-	const testCertPEM = "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n"
-	
+	// Generate a valid test certificate PEM
+	testCertPEM := createTestCertPEM(t)
+
 	// Track server interactions
 	var reqCount int
 	var lastIfNoneMatch string
-	
+
 	// Create test server that simulates CA bundle endpoint
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqCount++
 		lastIfNoneMatch = r.Header.Get("If-None-Match")
-		
+
 		// Return 304 if client sends matching ETag
 		if lastIfNoneMatch == `"v1"` {
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
-		
+
 		// First request: return bundle with ETag
 		w.Header().Set("ETag", `"v1"`)
 		_, _ = fmt.Fprint(w, testCertPEM) //nolint:errcheck
@@ -48,7 +55,7 @@ func TestEnsureCABundle_DownloadAndCache(t *testing.T) {
 
 	// Use a fixed temp directory for consistent caching behavior
 	tempDir := t.TempDir()
-	
+
 	// Track file writes to verify caching behavior
 	writeCount := 0
 	app := newTestApp(t, Config{
@@ -69,18 +76,24 @@ func TestEnsureCABundle_DownloadAndCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("First ensureCABundle call failed: %v", err)
 	}
-	
+
 	// Verify bundle file was created with correct content
 	assertFileContent(t, bundlePath1, testCertPEM)
-	
+
 	// Verify ETag was persisted
 	etagPath := filepath.Join(filepath.Dir(bundlePath1), "cacert.etag")
 	assertFileContent(t, etagPath, `"v1"`)
-	
+
 	// Verify server interaction
 	if reqCount != 1 || lastIfNoneMatch != "" {
-		t.Errorf("First request: got count=%d, If-None-Match=%q; want count=1, If-None-Match=empty", 
+		t.Errorf("First request: got count=%d, If-None-Match=%q; want count=1, If-None-Match=empty",
 			reqCount, lastIfNoneMatch)
+	}
+
+	// Make the cached file appear old to force a conditional request
+	oldTime := time.Now().Add(-25 * time.Hour) // Make it older than 24 hours
+	if err := os.Chtimes(bundlePath1, oldTime, oldTime); err != nil {
+		t.Fatalf("Failed to change file times: %v", err)
 	}
 
 	// Second call: should use cache (304 response)
@@ -88,7 +101,7 @@ func TestEnsureCABundle_DownloadAndCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Second ensureCABundle call failed: %v", err)
 	}
-	
+
 	// Verify same path returned and no additional writes
 	if bundlePath1 != bundlePath2 {
 		t.Errorf("Bundle path changed: %s != %s", bundlePath1, bundlePath2)
@@ -96,10 +109,10 @@ func TestEnsureCABundle_DownloadAndCache(t *testing.T) {
 	if writeCount != 1 {
 		t.Errorf("Expected 1 file write, got %d", writeCount)
 	}
-	
+
 	// Verify conditional request was made
 	if reqCount != 2 || lastIfNoneMatch != `"v1"` {
-		t.Errorf("Second request: got count=%d, If-None-Match=%q; want count=2, If-None-Match=\"v1\"", 
+		t.Errorf("Second request: got count=%d, If-None-Match=%q; want count=2, If-None-Match=\"v1\"",
 			reqCount, lastIfNoneMatch)
 	}
 }
@@ -107,19 +120,19 @@ func TestEnsureCABundle_DownloadAndCache(t *testing.T) {
 // TestEnsureCABundle_HTTPError tests error handling for HTTP failures
 func TestEnsureCABundle_HTTPError(t *testing.T) {
 	t.Parallel()
-	
+
 	// Server that returns 500 error
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
-	
+
 	app := newTestApp(t, Config{
 		CABundleURL: server.URL,
 		HTTPClient:  server.Client(),
 		CacheDir:    func() (string, error) { return t.TempDir(), nil },
 	})
-	
+
 	_, err := app.ensureCABundle(context.Background())
 	if err == nil {
 		t.Fatal("Expected error for HTTP 500, got nil")
@@ -132,12 +145,12 @@ func TestEnsureCABundle_HTTPError(t *testing.T) {
 // TestEnsureCABundle_NetworkError tests network failure handling
 func TestEnsureCABundle_NetworkError(t *testing.T) {
 	t.Parallel()
-	
+
 	app := newTestApp(t, Config{
 		CABundleURL: "http://nonexistent.invalid",
 		CacheDir:    func() (string, error) { return t.TempDir(), nil },
 	})
-	
+
 	_, err := app.ensureCABundle(context.Background())
 	if err == nil {
 		t.Fatal("Expected network error, got nil")
@@ -147,12 +160,12 @@ func TestEnsureCABundle_NetworkError(t *testing.T) {
 // TestEnsureCABundle_CacheDirError tests cache directory creation failure
 func TestEnsureCABundle_CacheDirError(t *testing.T) {
 	t.Parallel()
-	
+
 	app := newTestApp(t, Config{
 		CABundleURL: "http://example.com",
 		CacheDir:    func() (string, error) { return "", fmt.Errorf("cache dir error") },
 	})
-	
+
 	_, err := app.ensureCABundle(context.Background())
 	if err == nil {
 		t.Fatal("Expected cache dir error, got nil")
@@ -165,7 +178,7 @@ func TestEnsureCABundle_CacheDirError(t *testing.T) {
 // TestLoadTrustedCABundle tests loading CA bundle from various sources
 func TestLoadTrustedCABundle(t *testing.T) {
 	t.Parallel()
-	
+
 	testCases := []struct {
 		name        string
 		bundlePath  string
@@ -199,13 +212,13 @@ func TestLoadTrustedCABundle(t *testing.T) {
 			setup:       func(t *testing.T) string { return "" },
 		},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			bundlePath := tc.setup(t)
-			
+
 			certs, err := loadTrustedCABundle(bundlePath)
-			
+
 			if tc.expectError {
 				if err == nil {
 					t.Errorf("Expected error for %s, got nil", tc.name)
@@ -225,74 +238,137 @@ func TestLoadTrustedCABundle(t *testing.T) {
 // TestFetchAndAppendCABundle tests CA bundle fetching and appending
 func TestFetchAndAppendCABundle(t *testing.T) {
 	t.Parallel()
-	
+
 	// Test HTTP error case
 	errorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer errorServer.Close()
-	
+
 	app := newTestApp(t, Config{
 		CABundleURL: errorServer.URL,
+		HTTPClient:  errorServer.Client(),
 		CacheDir:    func() (string, error) { return t.TempDir(), nil },
 	})
-	
+
 	var certs []*x509.Certificate
 	err := app.fetchAndAppendCABundle(context.Background(), &certs)
 	if err == nil {
 		t.Error("Expected error for HTTP 500, got nil")
 	}
-	
+
 	// Test invalid PEM content
 	invalidPEMServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("invalid pem content")) //nolint:errcheck
 	}))
 	defer invalidPEMServer.Close()
-	
+
 	app2 := newTestApp(t, Config{
 		CABundleURL: invalidPEMServer.URL,
+		HTTPClient:  invalidPEMServer.Client(),
 		CacheDir:    func() (string, error) { return t.TempDir(), nil },
 	})
-	
+
 	var certs2 []*x509.Certificate
 	_ = app2.fetchAndAppendCABundle(context.Background(), &certs2)
 	// Note: fetchAndAppendCABundle might be lenient with invalid PEM content
 	// so we don't require an error here
-	
-	// Create test server with valid certificate PEM
+
+	// Clear the global CA bundle cache to avoid interference from previous tests
+	clearCABundleCache()
+
+	// Instead of using HTTP, create a local CA bundle file to avoid network calls
+	tempDir := t.TempDir()
+	caBundlePath := filepath.Join(tempDir, "test-ca-bundle.pem")
 	testCert := createTestCertPEM(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, testCert) //nolint:errcheck
-	}))
-	defer server.Close()
 	
+	if err := os.WriteFile(caBundlePath, []byte(testCert), 0644); err != nil {
+		t.Fatalf("Failed to create test CA bundle file: %v", err)
+	}
+
 	app3 := newTestApp(t, Config{
-		CABundleURL: server.URL,
-		HTTPClient:  server.Client(),
-		CacheDir:    func() (string, error) { return t.TempDir(), nil },
+		TrustedCABundle: caBundlePath, // Use local file instead of HTTP
+		CacheDir:        func() (string, error) { return tempDir, nil },
 	})
 	
+	t.Logf("Using local CA bundle file: %s", caBundlePath)
+
 	// Start with some existing certificates
 	existingCerts := []*x509.Certificate{createTestCert(t, "existing.com")}
 	certs3 := existingCerts
-	
+
 	err = app3.fetchAndAppendCABundle(context.Background(), &certs3)
 	if err != nil {
 		t.Fatalf("fetchAndAppendCABundle failed: %v", err)
 	}
-	
+
 	// Should have more certificates now
 	if len(certs3) <= len(existingCerts) {
-		t.Errorf("Expected more certificates after append, got %d (started with %d)", 
+		t.Errorf("Expected more certificates after append, got %d (started with %d)",
 			len(certs3), len(existingCerts))
+	}
+}
+
+// TestTrustedCABundle_BypassesNetwork verifies that when Config.TrustedCABundle
+// is set, the CA bundle loading path does not perform any HTTP requests even
+// if a CABundleURL and HTTPClient are provided.
+func TestTrustedCABundle_BypassesNetwork(t *testing.T) {
+	t.Parallel()
+
+	clearCABundleCache()
+
+	// Prepare a local CA bundle file with a valid certificate
+	tempDir := t.TempDir()
+	caBundlePath := filepath.Join(tempDir, "local-ca.pem")
+	pemData := createTestCertPEM(t)
+	if err := os.WriteFile(caBundlePath, []byte(pemData), 0o644); err != nil {
+		t.Fatalf("failed to write local CA bundle: %v", err)
+	}
+
+	// Create an httptest server that increments a counter when called
+	var reqCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		// respond with something valid to be safe
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, pemData)
+	}))
+	defer server.Close()
+
+	// Construct app that would *use* the server if TrustedCABundle wasn't set
+	app := newTestApp(t, Config{
+		TrustedCABundle: caBundlePath,
+		CABundleURL:     server.URL,
+		HTTPClient:      server.Client(),
+		CacheDir:        func() (string, error) { return tempDir, nil },
+	})
+
+	// Call getCachedCABundle which should load from local file and not hit server
+	certs, err := app.getCachedCABundle(context.Background())
+	if err != nil {
+		t.Fatalf("getCachedCABundle failed: %v", err)
+	}
+
+	// Ensure the HTTP server was not contacted
+	if c := atomic.LoadInt32(&reqCount); c != 0 {
+		t.Fatalf("expected 0 HTTP requests to CA bundle server, got %d", c)
+	}
+
+	// Ensure we got the expected certificates by comparing lengths
+	fromFile, err := loadTrustedCABundle(caBundlePath)
+	if err != nil {
+		t.Fatalf("loadTrustedCABundle failed: %v", err)
+	}
+	if len(certs) != len(fromFile) {
+		t.Fatalf("certificate count mismatch: got %d, want %d", len(certs), len(fromFile))
 	}
 }
 
 // TestCacheDir tests the cacheDir function error cases
 func TestCacheDir(t *testing.T) {
 	t.Parallel()
-	
+
 	// Test successful case
 	app := newTestApp(t, Config{})
 	dir, err := app.cacheDir()
@@ -302,16 +378,16 @@ func TestCacheDir(t *testing.T) {
 	if dir == "" {
 		t.Error("Expected non-empty cache directory")
 	}
-	
+
 	// Test with custom cache dir function that returns error
 	errorCacheDir := func() (string, error) {
 		return "", fmt.Errorf("cache dir error")
 	}
-	
+
 	app2 := newTestApp(t, Config{
 		CacheDir: errorCacheDir,
 	})
-	
+
 	// This should trigger the error path in ensureCABundle
 	_, err = app2.ensureCABundle(context.Background())
 	if err == nil {
@@ -361,11 +437,50 @@ func createTestCertPEM(t *testing.T) string {
 	return string(pem.EncodeToMemory(block))
 }
 
-// createTestCert creates a minimal test certificate
+// createTestCert creates a valid test certificate
 func createTestCert(t *testing.T, commonName string) *x509.Certificate {
 	t.Helper()
-	return &x509.Certificate{
-		Raw:    []byte{0x30, 0x82, 0x01, 0x23}, // Minimal valid DER prefix
-		Subject: pkix.Name{CommonName: commonName},
+	
+	// Create a real certificate using Go's crypto libraries
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: commonName,
+		},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 	}
+	
+	// Generate a private key
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate private key: %v", err)
+	}
+	
+	// Create the certificate
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("Failed to create certificate: %v", err)
+	}
+	
+	// Parse the certificate to return it
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		t.Fatalf("Failed to parse created certificate: %v", err)
+	}
+	
+	return cert
+}
+
+// clearCABundleCache clears the global CA bundle cache for testing
+func clearCABundleCache() {
+	caBundleCache.Lock()
+	defer caBundleCache.Unlock()
+	caBundleCache.certs = nil
+	caBundleCache.err = nil
+	caBundleCache.path = ""
+	caBundleCache.timestamp = time.Time{}
 }

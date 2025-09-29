@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lesydimitri/sniffl/internal/logging"
 )
 
 func TestEntry_IsValid(t *testing.T) {
@@ -152,16 +154,16 @@ func TestQuery_DisplayResults(t *testing.T) {
 func TestQuery_NewQuery(t *testing.T) {
 	// Test that NewQuery creates a query instance successfully
 	var outBuf, errBuf bytes.Buffer
-	
+
 	query, err := NewQuery(&outBuf, &errBuf)
 	if err != nil {
 		t.Errorf("NewQuery() returned unexpected error: %v", err)
 	}
-	
+
 	if query == nil {
 		t.Error("NewQuery() returned nil query")
 	}
-	
+
 	// Check that initialization message was written
 	output := outBuf.String()
 	if !strings.Contains(output, "Initializing Certificate Transparency client") {
@@ -212,12 +214,12 @@ func TestDomainPatternMatching(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Simulate the ILIKE pattern matching used in the query
 			pattern := "%" + tt.domain + "%"
-			
+
 			// Simple pattern matching simulation
 			matches := strings.Contains(tt.testName, tt.domain)
-			
+
 			if matches != tt.want {
-				t.Errorf("Domain pattern matching for %q against %q = %v, want %v", 
+				t.Errorf("Domain pattern matching for %q against %q = %v, want %v",
 					tt.testName, pattern, matches, tt.want)
 			}
 		})
@@ -226,7 +228,7 @@ func TestDomainPatternMatching(t *testing.T) {
 
 func TestIsRelevantDomain(t *testing.T) {
 	ct := &Query{}
-	
+
 	tests := []struct {
 		name         string
 		domainName   string
@@ -239,7 +241,7 @@ func TestIsRelevantDomain(t *testing.T) {
 		{"subdomain match", "www.example.com", "example.com", true},
 		{"deep subdomain", "api.v1.example.com", "example.com", true},
 		{"case insensitive", "WWW.EXAMPLE.COM", "example.com", true},
-		
+
 		// Invalid matches
 		{"different domain", "different.com", "example.com", false},
 		{"partial string match", "notexample.com", "example.com", false},
@@ -255,7 +257,7 @@ func TestIsRelevantDomain(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := ct.isRelevantDomain(tt.domainName, tt.targetDomain)
 			if result != tt.expected {
-				t.Errorf("isRelevantDomain(%q, %q) = %v, want %v", 
+				t.Errorf("isRelevantDomain(%q, %q) = %v, want %v",
 					tt.domainName, tt.targetDomain, result, tt.expected)
 			}
 		})
@@ -274,14 +276,14 @@ func TestIsValidDomainName(t *testing.T) {
 		{"deep subdomain", "api.v1.example.com", true},
 		{"wildcard domain", "*.example.com", true},
 		{"hyphenated domain", "my-site.example.com", true},
-		
+
 		// Invalid domains
 		{"email address", "user@example.com", false},
 		{"certificate name", "AS207960 Test Intermediate - example.com", false},
 		{"empty string", "", false},
 		{"just spaces", "   ", false},
 		{"no dot", "localhost", false},
-		{"starts with space", " example.com", true},  // Trimmed, so valid
+		{"starts with space", " example.com", true}, // Trimmed, so valid
 		{"ends with space", "example.com ", true},   // Trimmed, so valid
 		{"contains spaces", "my site.com", false},
 		{"too long", strings.Repeat("a", 250) + ".com", false},
@@ -302,7 +304,7 @@ func TestIsValidDomainName(t *testing.T) {
 
 func TestQuery_QueryDomain_Success(t *testing.T) {
 	t.Parallel()
-	
+
 	// Create a mock HTTP server that returns sample CT data
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Mock response with sample certificate data
@@ -324,25 +326,25 @@ func TestQuery_QueryDomain_Success(t *testing.T) {
 		_, _ = w.Write([]byte(response)) //nolint:errcheck
 	}))
 	defer server.Close()
-	
+
 	var outBuf, errBuf bytes.Buffer
-	
+
 	// Create CT query with mocked HTTP client
 	ct, err := NewQueryWithClient(server.Client(), &outBuf, &errBuf)
 	if err != nil {
 		t.Fatalf("NewQueryWithClient() failed: %v", err)
 	}
-	
+
 	// Test the queryCrtSh method directly with our mock server
 	results, err := ct.queryCrtSh(server.URL + "/?q=example.com&output=json")
 	if err != nil {
 		t.Fatalf("queryCrtSh() failed: %v", err)
 	}
-	
+
 	if len(results) != 1 {
 		t.Errorf("Expected 1 result, got %d", len(results))
 	}
-	
+
 	if results[0].CommonName != "example.com" {
 		t.Errorf("Expected CommonName 'example.com', got '%s'", results[0].CommonName)
 	}
@@ -350,7 +352,7 @@ func TestQuery_QueryDomain_Success(t *testing.T) {
 
 func TestQuery_Close(t *testing.T) {
 	t.Parallel()
-	
+
 	var outBuf, errBuf bytes.Buffer
 	ct := &Query{
 		httpClient: &http.Client{},
@@ -367,7 +369,7 @@ func TestQuery_Close(t *testing.T) {
 
 func TestQuery_queryCrtSh(t *testing.T) {
 	t.Parallel()
-	
+
 	// Test successful response
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		response := `[{"id": 123, "common_name": "test.com"}]`
@@ -415,7 +417,7 @@ func TestQuery_queryCrtSh(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error for invalid JSON, got nil")
 	}
-	
+
 	// Test network error
 	_, err = ct.queryCrtSh("http://invalid-url-that-does-not-exist.invalid")
 	if err == nil {
@@ -425,7 +427,7 @@ func TestQuery_queryCrtSh(t *testing.T) {
 
 func TestIsValidSubdomainPrefix(t *testing.T) {
 	t.Parallel()
-	
+
 	tests := []struct {
 		name     string
 		prefix   string
@@ -440,7 +442,7 @@ func TestIsValidSubdomainPrefix(t *testing.T) {
 		{"invalid end with hyphen", "invalid-", false},
 		{"valid complex", "sub.domain-name", true},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := isValidSubdomainPrefix(tt.prefix)
@@ -452,10 +454,203 @@ func TestIsValidSubdomainPrefix(t *testing.T) {
 }
 
 // Benchmark the certificate validity checking logic
+func TestNewQuery_Variants(t *testing.T) {
+	tests := []struct {
+		name string
+		fn   func() (*Query, error)
+	}{
+		{
+			name: "NewQuery",
+			fn: func() (*Query, error) {
+				return NewQuery(&bytes.Buffer{}, &bytes.Buffer{})
+			},
+		},
+		{
+			name: "NewQueryWithLogger",
+			fn: func() (*Query, error) {
+				logger := logging.New("info", "text", &bytes.Buffer{})
+				return NewQueryWithLogger(&bytes.Buffer{}, &bytes.Buffer{}, logger)
+			},
+		},
+		{
+			name: "NewQueryWithClient",
+			fn: func() (*Query, error) {
+				client := &http.Client{Timeout: 5 * time.Second}
+				return NewQueryWithClient(client, &bytes.Buffer{}, &bytes.Buffer{})
+			},
+		},
+		{
+			name: "NewQueryWithClientAndLogger",
+			fn: func() (*Query, error) {
+				client := &http.Client{Timeout: 5 * time.Second}
+				logger := logging.New("info", "text", &bytes.Buffer{})
+				return NewQueryWithClientAndLogger(client, &bytes.Buffer{}, &bytes.Buffer{}, logger)
+			},
+		},
+		{
+			name: "NewQueryWithClientAndLogger_NilLogger",
+			fn: func() (*Query, error) {
+				client := &http.Client{Timeout: 5 * time.Second}
+				return NewQueryWithClientAndLogger(client, &bytes.Buffer{}, &bytes.Buffer{}, nil)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			query, err := tt.fn()
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if query == nil {
+				t.Error("Expected non-nil query")
+				return
+			}
+
+			if query.httpClient == nil {
+				t.Error("Expected non-nil HTTP client")
+			}
+
+			if query.logger == nil {
+				t.Error("Expected non-nil logger")
+			}
+
+			// Test Close method
+			if err := query.Close(); err != nil {
+				t.Errorf("Close() returned error: %v", err)
+			}
+		})
+	}
+}
+
+func TestMergeDNSNames(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing []string
+		new      []string
+		expected []string
+	}{
+		{
+			name:     "empty_existing",
+			existing: []string{},
+			new:      []string{"example.com", "www.example.com"},
+			expected: []string{"example.com", "www.example.com"},
+		},
+		{
+			name:     "empty_new",
+			existing: []string{"example.com"},
+			new:      []string{},
+			expected: []string{"example.com"},
+		},
+		{
+			name:     "no_duplicates",
+			existing: []string{"example.com"},
+			new:      []string{"www.example.com", "api.example.com"},
+			expected: []string{"example.com", "www.example.com", "api.example.com"},
+		},
+		{
+			name:     "with_duplicates",
+			existing: []string{"example.com", "www.example.com"},
+			new:      []string{"www.example.com", "api.example.com"},
+			expected: []string{"example.com", "www.example.com", "api.example.com"},
+		},
+		{
+			name:     "all_duplicates",
+			existing: []string{"example.com", "www.example.com"},
+			new:      []string{"example.com", "www.example.com"},
+			expected: []string{"example.com", "www.example.com"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := mergeDNSNames(tt.existing, tt.new)
+
+			if len(result) != len(tt.expected) {
+				t.Errorf("Expected length %d, got %d", len(tt.expected), len(result))
+				return
+			}
+
+			// Convert to maps for easier comparison
+			resultMap := make(map[string]bool)
+			for _, name := range result {
+				resultMap[name] = true
+			}
+
+			expectedMap := make(map[string]bool)
+			for _, name := range tt.expected {
+				expectedMap[name] = true
+			}
+
+			for name := range expectedMap {
+				if !resultMap[name] {
+					t.Errorf("Expected %q in result", name)
+				}
+			}
+
+			for name := range resultMap {
+				if !expectedMap[name] {
+					t.Errorf("Unexpected %q in result", name)
+				}
+			}
+		})
+	}
+}
+
+// Mock transport for testing HTTP requests
+// ...existing code...
+
+func BenchmarkMergeDNSNames(b *testing.B) {
+	existing := []string{"example.com", "www.example.com", "api.example.com"}
+	new := []string{"www.example.com", "cdn.example.com", "mail.example.com"}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = mergeDNSNames(existing, new)
+	}
+}
+
+func BenchmarkIsRelevantDomain(b *testing.B) {
+	query := &Query{}
+
+	testCases := []struct {
+		name         string
+		targetDomain string
+	}{
+		{"www.example.com", "example.com"},
+		{"api.subdomain.example.com", "example.com"},
+		{"different.com", "example.com"},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tc := testCases[i%len(testCases)]
+		_ = query.isRelevantDomain(tc.name, tc.targetDomain)
+	}
+}
+
+func BenchmarkIsValidDomainName(b *testing.B) {
+	testDomains := []string{
+		"example.com",
+		"www.example.com",
+		"api.subdomain.example.com",
+		"invalid..domain",
+		"valid-domain.com",
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		domain := testDomains[i%len(testDomains)]
+		_ = isValidDomainName(domain)
+	}
+}
+
 func BenchmarkCertificateValidityCheck(b *testing.B) {
 	entries := make([]Entry, 1000)
 	now := time.Now()
-	
+
 	// Create test data with mixed validity
 	for i := range entries {
 		if i%2 == 0 {
@@ -472,9 +667,9 @@ func BenchmarkCertificateValidityCheck(b *testing.B) {
 			}
 		}
 	}
-	
+
 	b.ResetTimer()
-	
+
 	for i := 0; i < b.N; i++ {
 		validCount := 0
 		for _, entry := range entries {

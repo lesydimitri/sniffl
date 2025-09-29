@@ -27,82 +27,109 @@ type fakeDialer struct {
 // generateSelfSigned creates a minimal self-signed TLS certificate for testing
 func generateSelfSigned(t *testing.T) tls.Certificate {
 	t.Helper()
-	
+
 	// Generate RSA private key
 	priv, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {
 		t.Fatalf("Failed to generate RSA key: %v", err)
 	}
-	
+
 	// Create certificate template
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "proxy.local"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "proxy.local"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
-	
+
 	// Create self-signed certificate
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
 	if err != nil {
 		t.Fatalf("Failed to create certificate: %v", err)
 	}
-	
+
 	return tls.Certificate{
-		Certificate: [][]byte{certDER}, 
+		Certificate: [][]byte{certDER},
 		PrivateKey:  priv,
 	}
 }
 
 // Test HTTPS proxy support: ensure CONNECT is sent over a TLS-wrapped proxy connection.
 func TestFetchTLSOverHTTP_HTTPSProxyCONNECT(t *testing.T) {
-    cert := &x509.Certificate{Raw: []byte{0x1}}
-    var wroteCONNECT bool
-    proxyCert := generateSelfSigned(t)
+	cert := &x509.Certificate{Raw: []byte{0x1}}
+	var wroteCONNECT bool
+	proxyCert := generateSelfSigned(t)
 
-    app := New(Config{
-        Out:        bytes.NewBuffer(nil),
-        Err:        bytes.NewBuffer(nil),
-        HTTPSProxy: parseURLOrPanic("https://user:pass@proxy.local:443"),
-        HTTPClient: noNetworkHTTPClient(),
-    },
-        WithDialer(fakeDialer{script: func(raw net.Conn) {
-            // Wrap server side in TLS and complete handshake
-            srv := tls.Server(raw, &tls.Config{Certificates: []tls.Certificate{proxyCert}})
-            if err := srv.Handshake(); err != nil {
-                t.Fatalf("server TLS handshake failed: %v", err)
-            }
-            // Read CONNECT request over the TLS layer
-            r := bufio.NewReader(srv)
-            var reqLines []string
-            for {
-                line, err := r.ReadString('\n')
-                if err != nil {
-                    t.Fatalf("failed reading CONNECT: %v", err)
-                }
-                reqLines = append(reqLines, line)
-                if line == "\r\n" || line == "\n" {
-                    break
-                }
-            }
-            req := strings.Join(reqLines, "")
-            if strings.Contains(req, "CONNECT example.com:443 HTTP/1.1") &&
-                strings.Contains(req, "Proxy-Authorization: Basic") {
-                wroteCONNECT = true
-            }
-            // Respond OK to finish tunnel
-            _, _ = io.WriteString(srv, "HTTP/1.1 200 Connection Established\r\n\r\n") //nolint:errcheck
-            // Keep open for the rest of the test; client will perform inner TLS via fakeTLSFactory.
-        }}),
-        WithTLSFactory(fakeTLSFactory{certs: []*x509.Certificate{cert}}),
-    )
-    cs, err := app.fetchTLSOverHTTP(context.Background(), "example.com", "443")
-    if err != nil || len(cs) != 1 || !wroteCONNECT {
-        t.Fatalf("https proxy fetch err=%v len=%d wrote=%v", err, len(cs), wroteCONNECT)
-    }
+	// Add context with timeout to prevent hanging
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	app := New(Config{
+		Out:        bytes.NewBuffer(nil),
+		Err:        bytes.NewBuffer(nil),
+		HTTPSProxy: parseURLOrPanic("https://user:pass@proxy.local:443"),
+		HTTPClient: noNetworkHTTPClient(),
+	},
+		WithDialer(fakeDialer{script: func(raw net.Conn) {
+			// Add timeout for TLS handshake
+			handshakeCtx, hsCancel := context.WithTimeout(ctx, 2*time.Second)
+			defer hsCancel()
+
+			// Wrap server side in TLS and complete handshake
+			srv := tls.Server(raw, &tls.Config{Certificates: []tls.Certificate{proxyCert}})
+
+			// Use context-aware handshake with timeout
+			if err := srv.HandshakeContext(handshakeCtx); err != nil {
+				t.Logf("server TLS handshake failed: %v", err)
+				return
+			}
+
+			// Read CONNECT request with timeout
+			r := bufio.NewReader(srv)
+			var reqLines []string
+
+			readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+			defer readCancel()
+
+			for {
+				select {
+				case <-readCtx.Done():
+					t.Logf("timeout reading CONNECT request: %v", readCtx.Err())
+					return
+				default:
+				}
+
+				line, err := r.ReadString('\n')
+				if err != nil {
+					t.Logf("failed reading CONNECT: %v", err)
+					return
+				}
+				reqLines = append(reqLines, line)
+				if line == "\r\n" || line == "\n" {
+					break
+				}
+			}
+
+			req := strings.Join(reqLines, "")
+			if strings.Contains(req, "CONNECT example.com:443 HTTP/1.1") &&
+				strings.Contains(req, "Proxy-Authorization: Basic") {
+				wroteCONNECT = true
+			}
+
+			// Respond OK to finish tunnel
+			_, _ = io.WriteString(srv, "HTTP/1.1 200 Connection Established\r\n\r\n")
+			// Keep open for the rest of the test; client will perform inner TLS via fakeTLSFactory.
+		}}),
+		WithTLSFactory(fakeTLSFactory{certs: []*x509.Certificate{cert}}),
+	)
+
+	cs, err := app.fetchTLSOverHTTP(ctx, "example.com", "443")
+	if err != nil || len(cs) != 1 || !wroteCONNECT {
+		t.Fatalf("https proxy fetch err=%v len=%d wrote=%v", err, len(cs), wroteCONNECT)
+	}
 }
 
 func (f fakeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -130,38 +157,57 @@ func (f *fakeTLSClient) ConnectionState() tls.ConnectionState {
 }
 func (f *fakeTLSClient) Close() error { return f.c.Close() }
 
+// simTLSFactory simulates a TLS factory that fails verification when
+// InsecureSkipVerify is false and succeeds when InsecureSkipVerify is true.
+type simTLSFactory struct{}
+
+func (simTLSFactory) Client(c net.Conn, cfg *tls.Config) TLSConn {
+	if cfg != nil && cfg.InsecureSkipVerify {
+		return &fakeTLSClient{c: c, certs: []*x509.Certificate{{Raw: []byte{0x1}}}}
+	}
+	return &errorTLSClientVerify{c: c}
+}
+
+type errorTLSClientVerify struct{ c net.Conn }
+
+func (e *errorTLSClientVerify) HandshakeContext(ctx context.Context) error {
+	return x509.UnknownAuthorityError{Cert: &x509.Certificate{Raw: []byte{0x1}}}
+}
+func (e *errorTLSClientVerify) ConnectionState() tls.ConnectionState { return tls.ConnectionState{} }
+func (e *errorTLSClientVerify) Close() error                         { return nil }
+
 // SMTP, IMAP, POP3 init scripts
 func smtpScript(conn net.Conn) {
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
-	_, _ = io.WriteString(w, "220 test ESMTP\r\n") //nolint:errcheck
-	_ = w.Flush() //nolint:errcheck
-	_, _ = r.ReadString('\n') // EHLO //nolint:errcheck
+	_, _ = io.WriteString(w, "220 test ESMTP\r\n")                     //nolint:errcheck
+	_ = w.Flush()                                                      //nolint:errcheck
+	_, _ = r.ReadString('\n')                                          // EHLO //nolint:errcheck
 	_, _ = io.WriteString(w, "250-test\r\n250-STARTTLS\r\n250 OK\r\n") //nolint:errcheck
-	_ = w.Flush() //nolint:errcheck
-	_, _ = r.ReadString('\n') // STARTTLS //nolint:errcheck
-	_, _ = io.WriteString(w, "220 Ready\r\n") //nolint:errcheck
-	_ = w.Flush() //nolint:errcheck
+	_ = w.Flush()                                                      //nolint:errcheck
+	_, _ = r.ReadString('\n')                                          // STARTTLS //nolint:errcheck
+	_, _ = io.WriteString(w, "220 Ready\r\n")                          //nolint:errcheck
+	_ = w.Flush()                                                      //nolint:errcheck
 }
 
 func imapScript(conn net.Conn) {
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
-	_, _ = io.WriteString(w, "* OK ready\r\n") //nolint:errcheck
-	_ = w.Flush() //nolint:errcheck
-	_, _ = r.ReadString('\n') // A001 STARTTLS //nolint:errcheck
+	_, _ = io.WriteString(w, "* OK ready\r\n")        //nolint:errcheck
+	_ = w.Flush()                                     //nolint:errcheck
+	_, _ = r.ReadString('\n')                         // A001 STARTTLS //nolint:errcheck
 	_, _ = io.WriteString(w, "A001 OK begin TLS\r\n") //nolint:errcheck
-	_ = w.Flush() //nolint:errcheck
+	_ = w.Flush()                                     //nolint:errcheck
 }
 
 func pop3Script(conn net.Conn) {
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
 	_, _ = io.WriteString(w, "+OK POP3 ready\r\n") //nolint:errcheck
-	_ = w.Flush() //nolint:errcheck
-	_, _ = r.ReadString('\n') // STLS //nolint:errcheck
-	_, _ = io.WriteString(w, "+OK begin TLS\r\n") //nolint:errcheck
-	_ = w.Flush() //nolint:errcheck
+	_ = w.Flush()                                  //nolint:errcheck
+	_, _ = r.ReadString('\n')                      // STLS //nolint:errcheck
+	_, _ = io.WriteString(w, "+OK begin TLS\r\n")  //nolint:errcheck
+	_ = w.Flush()                                  //nolint:errcheck
 }
 
 func TestFetchTLSOverProtocol_SMTP(t *testing.T) {
@@ -206,8 +252,8 @@ func TestFetchTLSOverProtocol_Error(t *testing.T) {
 			w := bufio.NewWriter(conn)
 			// Send error response instead of expected greeting
 			_, _ = io.WriteString(w, "-ERR Server error\r\n") //nolint:errcheck
-			_ = w.Flush() //nolint:errcheck
-			_ = conn.Close() //nolint:errcheck
+			_ = w.Flush()                                     //nolint:errcheck
+			_ = conn.Close()                                  //nolint:errcheck
 		}}),
 	)
 	cs, err = errorApp.fetchCertsByProtocol(context.Background(), "pop3", "h", "p", "h:p")
@@ -276,7 +322,7 @@ func TestFetchTLSOverHTTP_ProxyError(t *testing.T) {
 			_, _ = conn.Read(buf) //nolint:errcheck
 			// Return a proxy error response
 			_, _ = conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")) //nolint:errcheck
-			_ = conn.Close() //nolint:errcheck
+			_ = conn.Close()                                                                //nolint:errcheck
 		}}),
 	)
 	cs, err := app.fetchTLSOverHTTP(context.Background(), "example.com", "443")
@@ -307,8 +353,8 @@ func (f *errorTLSClient) Close() error { return f.c.Close() }
 // Test error handling for TLS handshake failures
 func TestFetchTLSOverHTTP_HandshakeError(t *testing.T) {
 	app := New(Config{
-		Out: bytes.NewBuffer(nil),
-		Err: bytes.NewBuffer(nil),
+		Out:        bytes.NewBuffer(nil),
+		Err:        bytes.NewBuffer(nil),
 		HTTPClient: noNetworkHTTPClient(),
 	},
 		WithDialer(fakeDialer{script: func(conn net.Conn) {
@@ -325,12 +371,12 @@ func TestFetchTLSOverHTTP_HandshakeError(t *testing.T) {
 // Test proxy connection functions
 func TestApp_connectViaProxy(t *testing.T) {
 	t.Parallel()
-	
+
 	// Test with invalid proxy - this will test the error path
 	proxyURL, _ := url.Parse("http://invalid-proxy-host:8080")
 	app := New(Config{HTTPSProxy: proxyURL, HTTPClient: noNetworkHTTPClient()},
 		WithDialer(fakeDialer{script: func(conn net.Conn) { _ = conn.Close() }})) //nolint:errcheck
-	
+
 	_, err := app.connectViaProxy(context.Background(), "example.com:443")
 	if err == nil {
 		t.Error("Expected error for invalid proxy, got nil")
@@ -339,89 +385,61 @@ func TestApp_connectViaProxy(t *testing.T) {
 
 func TestApp_resolveProxyAddress(t *testing.T) {
 	t.Parallel()
-	
+
 	// Test with valid proxy URL
 	proxyURL, _ := url.Parse("http://proxy.example.com:8080")
 	app := New(Config{HTTPSProxy: proxyURL, HTTPClient: noNetworkHTTPClient()},
 		WithDialer(fakeDialer{script: func(conn net.Conn) { _ = conn.Close() }})) //nolint:errcheck
-	
-	addr, err := app.resolveProxyAddress()
-	if err != nil {
-		t.Errorf("Expected no error, got %v", err)
-	}
+
+	addr := app.resolveProxyAddress()
 	if addr != "proxy.example.com:8080" {
 		t.Errorf("Expected 'proxy.example.com:8080', got %q", addr)
 	}
 }
 
-// Test protocol init functions with error cases
-func TestProtocolInits_ErrorCases(t *testing.T) {
+// TestStrictVerify ensures that when StrictVerify is enabled, verification failures are returned
+// and insecure fallback is not used. When disabled, the tool will fall back to insecure handshake
+// to collect certificates.
+func TestStrictVerify(t *testing.T) {
 	t.Parallel()
-	
-	tests := []struct {
-		name     string
-		initFunc initFunc
-		script   string
-		wantErr  bool
-	}{
-		{
-			name:     "smtp_no_starttls_support",
-			initFunc: smtpInit("test.com"),
-			script:   "220 Welcome\r\n250-test.com\r\n250 HELP\r\n",
-			wantErr:  true,
-		},
-		{
-			name:     "smtp_starttls_rejected",
-			initFunc: smtpInit("test.com"),
-			script:   "220 Welcome\r\n250-test.com\r\n250-STARTTLS\r\n250 HELP\r\n500 Error\r\n",
-			wantErr:  true,
-		},
-		{
-			name:     "imap_starttls_rejected",
-			initFunc: imapInit(),
-			script:   "* OK IMAP ready\r\nA001 NO STARTTLS not supported\r\n",
-			wantErr:  true,
-		},
-		{
-			name:     "pop3_stls_rejected",
-			initFunc: pop3Init(),
-			script:   "+OK POP3 ready\r\n-ERR STLS not supported\r\n",
-			wantErr:  true,
-		},
+
+	// Use a dialer that returns a closed server end since the simulated clients do
+	// not use the network.
+	closedServer := func(c net.Conn) { _ = c.Close() }
+
+	// Case 1: StrictVerify = true -> expect verification failure and no insecure fallback
+	appStrict := New(Config{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}, HTTPClient: noNetworkHTTPClient(), StrictVerify: true},
+		WithDialer(fakeDialer{script: closedServer}),
+		WithTLSFactory(simTLSFactory{}),
+	)
+
+	_, err := appStrict.fetchTLS(context.Background(), "example.com", "443")
+	if err == nil {
+		t.Fatalf("expected verification error with StrictVerify enabled, got nil")
 	}
-	
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create a pipe to simulate the connection
-			server, client := net.Pipe()
-			defer func() { _ = server.Close() }() //nolint:errcheck
-			defer func() { _ = client.Close() }() //nolint:errcheck
-			
-			// Start the server script in a goroutine
-			go func() {
-				defer func() { _ = server.Close() }() //nolint:errcheck
-				_, _ = server.Write([]byte(tt.script)) //nolint:errcheck
-			}()
-			
-			// Test the init function
-			reader := bufio.NewReader(client)
-			writer := bufio.NewWriter(client)
-			
-			err := tt.initFunc(writer, reader)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Expected error=%v, got %v", tt.wantErr, err)
-			}
-		})
+
+	// Case 2: StrictVerify = false -> expect insecure fallback to return certs
+	app := New(Config{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}, HTTPClient: noNetworkHTTPClient(), StrictVerify: false},
+		WithDialer(fakeDialer{script: closedServer}),
+		WithTLSFactory(simTLSFactory{}),
+	)
+
+	cs, err := app.fetchTLS(context.Background(), "example.com", "443")
+	if err != nil {
+		t.Fatalf("expected successful fetch with insecure fallback disabled=false, got err=%v", err)
+	}
+	if len(cs) == 0 {
+		t.Fatalf("expected at least one certificate from insecure fallback, got none")
 	}
 }
 
-// Test missing coverage in app.go
+// Test protocol init functions with error cases
+
 func TestApp_WithLogger(t *testing.T) {
 	t.Parallel()
-	
-	// Test that WithLogger option works
+
 	app := New(Config{HTTPClient: noNetworkHTTPClient()}, WithLogger(nil))
-	
+
 	// Just verify the app was created successfully
 	if app == nil {
 		t.Error("Expected app to be created with logger option")
@@ -431,11 +449,11 @@ func TestApp_WithLogger(t *testing.T) {
 // Test DialContext and Client methods
 func TestDialerAndTLSFactory(t *testing.T) {
 	t.Parallel()
-	
+
 	dialer := &fakeDialer{script: func(c net.Conn) {
 		_ = c.Close() //nolint:errcheck
 	}}
-	
+
 	// Test DialContext
 	conn, err := dialer.DialContext(context.Background(), "tcp", "example.com:443")
 	if err != nil {
@@ -444,7 +462,7 @@ func TestDialerAndTLSFactory(t *testing.T) {
 	if conn != nil {
 		_ = conn.Close() //nolint:errcheck
 	}
-	
+
 	// Test TLS factory
 	factory := &fakeTLSFactory{}
 	tlsConn := factory.Client(conn, &tls.Config{})

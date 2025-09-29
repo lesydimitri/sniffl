@@ -41,7 +41,7 @@ func TestSerialToHex(t *testing.T) {
 		{"zero", big.NewInt(0), "00"},
 		{"large_number", big.NewInt(0x123456), "12:34:56"},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := serialToHex(tc.in)
@@ -56,7 +56,7 @@ func TestSerialToHex(t *testing.T) {
 func TestCertificateSummary(t *testing.T) {
 	cert := makeCert(1, "example.com", "www.example.com")
 	summary := certificateSummary(cert)
-	
+
 	// Verify all required fields are present
 	requiredFields := []string{"Subject:", "Issuer:", "Serial:", "Not Before:", "Not After:", "DNS Names:"}
 	for _, field := range requiredFields {
@@ -64,7 +64,7 @@ func TestCertificateSummary(t *testing.T) {
 			t.Errorf("Summary missing required field %q in:\n%s", field, summary)
 		}
 	}
-	
+
 	// Verify DNS names are included
 	if !strings.Contains(summary, "example.com") {
 		t.Errorf("Summary should contain DNS name 'example.com'")
@@ -99,7 +99,7 @@ func TestDedupeCerts(t *testing.T) {
 			expected: 1,
 		},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			result := dedupeCerts(tc.input)
@@ -113,25 +113,32 @@ func TestDedupeCerts(t *testing.T) {
 // TestExportCertsSingle verifies single certificate export functionality
 func TestExportCertsSingle(t *testing.T) {
 	t.Parallel()
-	
+
 	files := make(map[string]*bytes.Buffer)
 	app := newTestAppForExport(t, files)
-	
+
 	certs := []*x509.Certificate{makeCert(1), makeCert(2)}
 	err := app.exportCertsSingle(certs, "testhost")
-	
+
 	if err != nil {
 		t.Fatalf("exportCertsSingle failed: %v", err)
 	}
-	
-	// Verify expected files were created
-	expectedFiles := []string{"testhost_cert_1.pem", "testhost_cert_2.pem"}
-	for _, filename := range expectedFiles {
-		if _, exists := files[filename]; !exists {
-			t.Errorf("Expected file %s was not created", filename)
+
+	// Verify expected files were created (timestamped prefix allowed)
+	expectedSuffixes := []string{"testhost_cert_1.pem", "testhost_cert_2.pem"}
+	for _, suffix := range expectedSuffixes {
+		found := false
+		for name := range files {
+			if strings.HasSuffix(name, suffix) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Expected a file ending with %s was not created", suffix)
 		}
 	}
-	
+
 	// Verify file content contains PEM data
 	for filename, buffer := range files {
 		content := buffer.String()
@@ -144,25 +151,25 @@ func TestExportCertsSingle(t *testing.T) {
 // TestExportCertsSingle_FileCreationError tests error handling during file creation
 func TestExportCertsSingle_FileCreationError(t *testing.T) {
 	t.Parallel()
-	
+
 	// Create mock HTTP client to prevent network requests
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("test")) //nolint:errcheck
 	}))
 	defer mockServer.Close()
-	
+
 	app := New(Config{
-		Out: bytes.NewBuffer(nil),
-		Err: bytes.NewBuffer(nil),
+		Out:        bytes.NewBuffer(nil),
+		Err:        bytes.NewBuffer(nil),
 		HTTPClient: mockServer.Client(),
 		FileCreator: func(name string) (io.WriteCloser, error) {
 			return nil, fmt.Errorf("file creation failed")
 		},
 	})
-	
+
 	certs := []*x509.Certificate{makeCert(1)}
 	err := app.exportCertsSingle(certs, "testhost")
-	
+
 	if err == nil {
 		t.Fatal("Expected error for file creation failure, got nil")
 	}
@@ -174,7 +181,7 @@ func TestExportCertsSingle_FileCreationError(t *testing.T) {
 // TestFinalizeExport tests the finalization of export operations
 func TestFinalizeExport(t *testing.T) {
 	t.Parallel()
-	
+
 	testCases := []struct {
 		name       string
 		exportMode string
@@ -190,7 +197,7 @@ func TestFinalizeExport(t *testing.T) {
 		},
 		{
 			name:       "full_bundle_export",
-			exportMode: "full_bundle", 
+			exportMode: "full_bundle",
 			certs:      []*x509.Certificate{makeCert(1, "example.com")},
 			expectFile: true,
 		},
@@ -208,50 +215,59 @@ func TestFinalizeExport(t *testing.T) {
 			expectFile: false,
 		},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			files := make(map[string]*bytes.Buffer)
 			var dnsBuffer bytes.Buffer
-			
+
+			// Create a mock HTTP server that returns 500 to catch any unexpected HTTP calls
+			mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+				t.Errorf("Unexpected HTTP call to %s", r.URL.Path)
+			}))
+			defer mockServer.Close()
+
 			cfg := Config{
 				ExportMode:  tc.exportMode,
 				Out:         bytes.NewBuffer(nil),
 				Err:         bytes.NewBuffer(nil),
 				FileCreator: createMockFileCreator(files),
+				HTTPClient:  mockServer.Client(), // Use mock client to catch unexpected calls
 			}
-			
+
 			// For full_bundle mode, provide a local CA bundle file to avoid HTTP requests
 			if tc.exportMode == "full_bundle" {
-				// Create a temporary CA bundle file
+				// Clear the global CA bundle cache to avoid interference from previous tests
+				clearCABundleCache()
+				
+				// Create a temporary CA bundle file with a real certificate
 				tempDir := t.TempDir()
 				caBundlePath := tempDir + "/cacert.pem"
-				caBundleContent := `-----BEGIN CERTIFICATE-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1234567890abcdef...
------END CERTIFICATE-----`
-				
+				caBundleContent := createTestCertPEM(t)
+
 				if err := os.WriteFile(caBundlePath, []byte(caBundleContent), 0644); err != nil {
 					t.Fatalf("Failed to create test CA bundle: %v", err)
 				}
-				
+
 				cfg.TrustedCABundle = caBundlePath // Use local file instead of HTTP download
 			}
-			
+
 			if tc.dnsExport {
 				cfg.DNSExport = &dnsBuffer
 			}
-			
+
 			app := New(cfg)
-			app.allCerts = tc.certs
-			
+			app.state.AddCertificates(tc.certs)
+
 			// Record DNS names for testing
-			app.recordDNSNames(tc.certs)
-			
+			app.RecordDNSNamesFromCertificates(tc.certs)
+
 			err := app.finalizeExport(context.Background())
 			if err != nil {
 				t.Fatalf("finalizeExport failed: %v", err)
 			}
-			
+
 			// Check file creation expectations
 			if tc.expectFile && len(files) == 0 {
 				t.Error("Expected file to be created but none were")
@@ -259,7 +275,7 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1234567890abcdef...
 			if !tc.expectFile && len(files) > 0 {
 				t.Errorf("Expected no files but got %d", len(files))
 			}
-			
+
 			// Check DNS export
 			if tc.dnsExport {
 				dnsContent := dnsBuffer.String()
@@ -274,35 +290,35 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1234567890abcdef...
 // TestHandleFinalExport tests the final export handling with CA bundle integration
 func TestHandleFinalExport(t *testing.T) {
 	t.Parallel()
-	
+
 	testCases := []struct {
-		name     string
-		mode     string
-		certs    []*x509.Certificate
-		expectCA bool
+		name            string
+		mode            string
+		certs           []*x509.Certificate
+		expectCA        bool
 		setupMockServer bool
 	}{
 		{
-			name:     "bundle_mode",
-			mode:     "bundle",
-			certs:    []*x509.Certificate{makeCert(1)},
-			expectCA: false,
+			name:            "bundle_mode",
+			mode:            "bundle",
+			certs:           []*x509.Certificate{makeCert(1)},
+			expectCA:        false,
 			setupMockServer: false,
 		},
 		// Skip full_bundle_mode test as it requires complex CA bundle setup
 		// This functionality is tested separately in CA bundle tests
 		{
-			name:  "empty_certs",
-			mode:  "bundle",
-			certs: []*x509.Certificate{},
+			name:            "empty_certs",
+			mode:            "bundle",
+			certs:           []*x509.Certificate{},
 			setupMockServer: false,
 		},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			files := make(map[string]*bytes.Buffer)
-			
+
 			var app *App
 			if tc.setupMockServer {
 				// Create mock CA bundle server for full_bundle mode
@@ -310,7 +326,7 @@ func TestHandleFinalExport(t *testing.T) {
 					_, _ = fmt.Fprint(w, createTestCertPEM(t)) //nolint:errcheck
 				}))
 				defer server.Close()
-				
+
 				app = New(Config{
 					Out:         bytes.NewBuffer(nil),
 					FileCreator: createMockFileCreator(files),
@@ -321,9 +337,9 @@ func TestHandleFinalExport(t *testing.T) {
 			} else {
 				app = newTestAppForExport(t, files)
 			}
-			
+
 			err := app.handleFinalExport(context.Background(), tc.mode, tc.certs)
-			
+
 			if len(tc.certs) == 0 {
 				// Should handle empty certs gracefully
 				if err != nil {
@@ -331,14 +347,21 @@ func TestHandleFinalExport(t *testing.T) {
 				}
 				return
 			}
-			
+
 			if err != nil {
 				t.Fatalf("handleFinalExport failed: %v", err)
 			}
-			
-			expectedFilename := fmt.Sprintf("combined_%s.pem", tc.mode)
-			if _, exists := files[expectedFilename]; !exists {
-				t.Errorf("Expected file %s was not created", expectedFilename)
+
+			expectedSuffix := fmt.Sprintf("combined_%s.pem", tc.mode)
+			found := false
+			for name := range files {
+				if strings.HasSuffix(name, expectedSuffix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("Expected a file ending with %s was not created", expectedSuffix)
 			}
 		})
 	}
@@ -347,34 +370,41 @@ func TestHandleFinalExport(t *testing.T) {
 // TestRecordDNSNames verifies DNS name collection from certificates
 func TestRecordDNSNames(t *testing.T) {
 	t.Parallel()
-	
+
 	// Create mock HTTP client to prevent network requests
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("test")) //nolint:errcheck
 	}))
 	defer mockServer.Close()
-	
+
 	app := New(Config{
-		Out: bytes.NewBuffer(nil),
-		Err: bytes.NewBuffer(nil),
+		Out:        bytes.NewBuffer(nil),
+		Err:        bytes.NewBuffer(nil),
 		HTTPClient: mockServer.Client(),
 	})
-	
+
 	certs := []*x509.Certificate{
 		makeCert(1, "example.com", "www.example.com"),
 		makeCert(2, "test.com", "example.com"), // duplicate example.com
 	}
-	
-	app.recordDNSNames(certs)
-	
-	// Should have 3 unique DNS names
-	expectedNames := []string{"example.com", "www.example.com", "test.com"}
-	if len(app.dnsNames) != len(expectedNames) {
-		t.Errorf("Expected %d DNS names, got %d", len(expectedNames), len(app.dnsNames))
+
+	app.RecordDNSNamesFromCertificates(certs)
+
+	// Should have 4 unique DNS names (including CommonName from makeCert)
+	expectedNames := []string{"example.com", "www.example.com", "test.com", "test.example.com"}
+	actualNames := app.GetDNSNames()
+	if len(actualNames) != len(expectedNames) {
+		t.Errorf("Expected %d DNS names, got %d", len(expectedNames), len(actualNames))
 	}
-	
+
+	// Convert to map for easier lookup
+	actualNamesMap := make(map[string]bool)
+	for _, name := range actualNames {
+		actualNamesMap[name] = true
+	}
+
 	for _, name := range expectedNames {
-		if _, exists := app.dnsNames[name]; !exists {
+		if !actualNamesMap[name] {
 			t.Errorf("Expected DNS name %s not found", name)
 		}
 	}
@@ -385,19 +415,19 @@ func TestRecordDNSNames(t *testing.T) {
 // newTestAppForExport creates an App configured for export testing
 func newTestAppForExport(t *testing.T, files map[string]*bytes.Buffer) *App {
 	t.Helper()
-	
+
 	// Create a mock HTTP server to prevent real network requests
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n")) //nolint:errcheck
 	}))
 	t.Cleanup(mockServer.Close)
-	
+
 	return New(Config{
 		Out:         bytes.NewBuffer(nil),
 		Err:         bytes.NewBuffer(nil),
 		FileCreator: createMockFileCreator(files),
 		CacheDir:    func() (string, error) { return t.TempDir(), nil },
-		CABundleURL: mockServer.URL,    // Use mock server
+		CABundleURL: mockServer.URL,      // Use mock server
 		HTTPClient:  mockServer.Client(), // Use mock client
 	})
 }

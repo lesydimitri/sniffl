@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -19,7 +20,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chromedp/chromedp"
 	"github.com/lesydimitri/sniffl/internal/config"
 	"github.com/lesydimitri/sniffl/internal/errors"
 	"github.com/lesydimitri/sniffl/internal/logging"
@@ -32,6 +32,7 @@ type ScreenshotApp struct {
 	config      *config.Config
 	logger      *logging.Logger
 	retryConfig retry.Config
+	ChromePool  ChromePool // Chrome instance pool for concurrent operations
 }
 
 // ScreenshotTarget represents a target for screenshot capture
@@ -83,27 +84,65 @@ func DefaultScreenshotOptions() *ScreenshotOptions {
 		Concurrency:     5,
 		Ports:           []int{80, 443, 8080, 8443},
 		DryRun:          false,
-		AutoDownload:    true,
+		AutoDownload:    true, // Auto-download Chrome if not found
 		SkipPortCheck:   false,
 		IgnoreSSLErrors: true, // Default to true for network reconnaissance
 	}
 }
-
 // NewScreenshotApp creates a new screenshot application instance
 func NewScreenshotApp(cfg *config.Config, logger *logging.Logger) *ScreenshotApp {
 	retryConfig := retry.Config{
 		MaxAttempts: cfg.RetryAttempts,
 		BaseDelay:   cfg.RetryDelay,
-		MaxDelay:    30 * time.Second,
+		MaxDelay:    cfg.Timeout,
 		Multiplier:  2.0,
 		Jitter:      true,
 	}
-
-	return &ScreenshotApp{
+	
+	app := &ScreenshotApp{
 		config:      cfg,
 		logger:      logger,
 		retryConfig: retryConfig,
+		ChromePool:  nil, // Will be initialized lazily
 	}
+	
+	// Initialize Chrome pool - will be set up when first screenshot is taken
+	// This allows for lazy initialization with proper Chrome path detection
+	
+	return app
+}
+
+// initializeChromePool initializes the Chrome pool if not already done
+func (app *ScreenshotApp) initializeChromePool(opts *ScreenshotOptions) error {
+	if app.ChromePool != nil {
+		return nil // Already initialized
+	}
+	
+	// Find Chrome executable
+	chromePath, err := FindChromeExecutableWithOptions(opts.AutoDownload)
+	if err != nil {
+		return fmt.Errorf("failed to find Chrome executable: %w", err)
+	}
+	
+	// Create pool configuration
+	poolConfig := DefaultChromePoolConfig()
+	poolConfig.ViewportWidth = opts.ViewportWidth
+	poolConfig.ViewportHeight = opts.ViewportHeight
+	poolConfig.UserAgent = opts.UserAgent
+	
+	// Adjust pool size based on concurrency
+	if opts.Concurrency > 0 {
+		poolConfig.MaxInstances = opts.Concurrency
+	}
+	
+	// Create the Chrome pool
+	app.ChromePool = NewRealChromePool(poolConfig, chromePath)
+	app.logger.Info("Chrome pool initialized", 
+		"chrome_path", chromePath,
+		"max_instances", poolConfig.MaxInstances,
+		"viewport", fmt.Sprintf("%dx%d", poolConfig.ViewportWidth, poolConfig.ViewportHeight))
+	
+	return nil
 }
 
 // ProcessTargets processes a list of targets for screenshots
@@ -141,8 +180,8 @@ func (app *ScreenshotApp) ProcessTargets(ctx context.Context, targets []Screensh
 		fmt.Printf("  Timeout: %s\n", opts.Timeout)
 		fmt.Printf("  Viewport: %dx%d\n", opts.ViewportWidth, opts.ViewportHeight)
 		fmt.Printf("  Concurrency: %d\n", opts.Concurrency)
-		fmt.Printf("  Port checking: %s\n", map[bool]string{true: "disabled", false: "enabled"}[opts.SkipPortCheck])
-		fmt.Printf("  SSL errors: %s\n", map[bool]string{true: "ignored", false: "strict"}[opts.IgnoreSSLErrors])
+		fmt.Printf("  Port checking: %s\n", map[bool]string{true: "disabled", false: "enabled"}[opts.SkipPortCheck || opts.DryRun])
+		fmt.Printf("  SSL errors: %s\n", map[bool]string{true: "strict", false: "ignored"}[!opts.IgnoreSSLErrors])
 		fmt.Println("=== END DRY RUN ===")
 
 		// Create fake results for dry-run
@@ -160,31 +199,60 @@ func (app *ScreenshotApp) ProcessTargets(ctx context.Context, targets []Screensh
 		return results, nil
 	}
 
-	// Always show basic progress to user
-	if len(targets) == 1 {
-		fmt.Printf("Taking screenshot of %s...\n", targets[0].URL)
+	// Optimize targets by filtering unreachable ones (unless disabled or in dry-run mode)
+	var finalTargets []ScreenshotTarget
+	if !opts.SkipPortCheck && !opts.DryRun {
+		app.logger.Progress("Checking connectivity for targets", "total", len(targets))
+		finalTargets = FilterReachableTargets(ctx, targets)
+		app.logger.Progress("Connectivity check completed", "reachable", len(finalTargets), "filtered", len(targets)-len(finalTargets))
 	} else {
-		fmt.Printf("Taking screenshots of %d targets", len(targets))
+		finalTargets = targets
+	}
+
+	if len(finalTargets) == 0 {
+		app.logger.Progress("No reachable targets found")
+		return []ScreenshotResult{}, nil
+	}
+
+	// Always show basic progress to user
+	if len(finalTargets) == 1 {
+		fmt.Printf("Taking screenshot of %s...\n", finalTargets[0].URL)
+	} else {
+		fmt.Printf("Taking screenshots of %d targets", len(finalTargets))
 		if opts.Concurrency > 1 {
 			fmt.Printf(" (concurrency: %d)", opts.Concurrency)
 		}
 		fmt.Println("...")
 	}
 
-	app.logger.Progress("Starting screenshot capture", "targets", len(targets), "concurrency", opts.Concurrency)
+	// Initialize Chrome pool before processing
+	if err := app.initializeChromePool(opts); err != nil {
+		return nil, fmt.Errorf("failed to initialize Chrome pool: %w", err)
+	}
+	
+	// Ensure Chrome pool is closed when done
+	defer func() {
+		if app.ChromePool != nil {
+			if err := app.ChromePool.Close(); err != nil {
+				app.logger.Warn("Failed to close Chrome pool", "error", err)
+			}
+		}
+	}()
+
+	app.logger.Progress("Starting screenshot capture", "targets", len(finalTargets), "concurrency", opts.Concurrency)
 
 	// Create a semaphore to limit concurrency
 	semaphore := make(chan struct{}, opts.Concurrency)
-	results := make([]ScreenshotResult, len(targets))
+	results := make([]ScreenshotResult, len(finalTargets))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var completed int
 
 	// Track whether we've printed an inline progress line
-	progressInline := len(targets) > 5 && !opts.DryRun
+	progressInline := len(finalTargets) > 5 && !opts.DryRun
 	var progressNewlineOnce sync.Once
 
-	for i, target := range targets {
+	for i, target := range finalTargets {
 		wg.Add(1)
 		go func(idx int, tgt ScreenshotTarget) {
 			defer wg.Done()
@@ -215,8 +283,8 @@ func (app *ScreenshotApp) ProcessTargets(ctx context.Context, targets []Screensh
 
 			// Show progress for larger operations (>5 targets)
 			if progressInline {
-				fmt.Fprintf(os.Stderr, "\rProgress: %d/%d completed", currentCompleted, len(targets))
-				if currentCompleted == len(targets) {
+				fmt.Fprintf(os.Stderr, "\rProgress: %d/%d completed", currentCompleted, len(finalTargets))
+				if currentCompleted == len(finalTargets) {
 					fmt.Fprintln(os.Stderr) // New line when complete
 				}
 			}
@@ -247,7 +315,7 @@ func (app *ScreenshotApp) ProcessTargets(ctx context.Context, targets []Screensh
 
 	// Always show completion summary to user
 	if failures == 0 {
-		if len(targets) == 1 {
+		if len(finalTargets) == 1 {
 			fmt.Printf("✓ Screenshot saved to %s\n", opts.OutputDir)
 		} else {
 			fmt.Printf("✓ %d screenshots saved to %s\n", successes, opts.OutputDir)
@@ -260,7 +328,7 @@ func (app *ScreenshotApp) ProcessTargets(ctx context.Context, targets []Screensh
 		}
 	}
 
-	app.logger.Progress("Screenshot capture completed", "total", len(targets), "successes", successes, "failures", failures)
+	app.logger.Progress("Screenshot capture completed", "total", len(finalTargets), "successes", successes, "failures", failures)
 
 	return results, nil
 }
@@ -273,25 +341,48 @@ func (app *ScreenshotApp) captureScreenshot(ctx context.Context, target Screensh
 		Timestamp: start,
 	}
 
-	// Dry-run is handled at the ProcessTargets level, so this should never be reached in dry-run mode
-
 	// Quick connectivity check first (especially important for CIDR scans)
-	if !opts.SkipPortCheck && !app.isServiceReachable(target) {
-		result.Error = fmt.Errorf("no service found at %s:%d", target.Host, target.Port)
-		result.Success = false
-		result.Duration = time.Since(start)
-		app.logger.Network("Service not reachable", "target", target.URL, "duration", result.Duration)
-		return result
+	// Skip connectivity check if Chrome is not available
+	if !opts.SkipPortCheck {
+		// Check if Chrome is available first
+		if _, err := FindChromeExecutableWithOptions(opts.AutoDownload); err != nil {
+			// Chrome is not available, skip connectivity check to avoid network requests
+			app.logger.Network("Skipping connectivity check - Chrome not available", "target", target.URL)
+		} else if !app.isServiceReachable(target) {
+			result.Error = fmt.Errorf("no service found at %s:%d", target.Host, target.Port)
+			result.Success = false
+			result.Duration = time.Since(start)
+			app.logger.Network("Service not reachable", "target", target.URL, "duration", result.Duration)
+			return result
+		}
+	}
+	
+	// For HTTPS targets on non-standard ports, do a quick TLS probe first
+	if target.Protocol == "https" && target.Port != 443 && !opts.SkipPortCheck {
+		if !app.probeTLSCapability(target.Host, target.Port) {
+			result.Error = fmt.Errorf("TLS not supported on %s:%d", target.Host, target.Port)
+			result.Success = false
+			result.Duration = time.Since(start)
+			app.logger.Network("TLS not supported", "target", target.URL, "duration", result.Duration)
+			return result
+		}
 	}
 
-	// Create context with timeout
-	timeoutCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
-	defer cancel()
-
-	// Capture screenshot with retry logic
-	err := retry.Do(timeoutCtx, app.retryConfig, app.logger, func() error {
-		return app.doScreenshot(timeoutCtx, target, opts, &result)
-	})
+	// Capture screenshot with smart retry logic
+	var err error
+	if opts.SkipPortCheck {
+		// If port checking is disabled, use normal retry logic
+		err = retry.Do(ctx, app.retryConfig, app.logger, func() error {
+			timeoutCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
+			defer cancel()
+			return app.doScreenshot(timeoutCtx, target, opts, &result)
+		})
+	} else {
+		// If port checking is enabled, try once with fast failure
+		timeoutCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
+		defer cancel()
+		err = app.doScreenshot(timeoutCtx, target, opts, &result)
+	}
 
 	result.Error = err
 	result.Success = err == nil
@@ -299,6 +390,7 @@ func (app *ScreenshotApp) captureScreenshot(ctx context.Context, target Screensh
 
 	return result
 }
+
 
 // isServiceReachable quickly checks if a service is reachable on the target host:port
 func (app *ScreenshotApp) isServiceReachable(target ScreenshotTarget) bool {
@@ -313,16 +405,58 @@ func (app *ScreenshotApp) isServiceReachable(target ScreenshotTarget) bool {
 
 	// For remote targets, use slightly longer timeout
 	if !app.isLocalNetwork(target.Host) {
-		timeout = 300 * time.Millisecond
+		timeout = 500 * time.Millisecond
 	}
 
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", target.Host, target.Port), timeout)
 	if err != nil {
 		return false
 	}
-	conn.Close()
+	if err := conn.Close(); err != nil {
+		// Connection close error after successful test (ignored)
+		_ = err
+	}
 	return true
 }
+
+// probeTLSCapability quickly checks if a port supports TLS without full handshake
+func (app *ScreenshotApp) probeTLSCapability(host string, port int) bool {
+	// Quick TLS probe with very short timeout
+	timeout := 2 * time.Second
+	
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), timeout)
+	if err != nil {
+		return false
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			// Connection close error (ignored)
+			_ = err
+		}
+	}()
+	
+	// Set a short deadline for the TLS probe
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		// Deadline set error (ignored)
+		_ = err
+	}
+	
+	// Attempt TLS handshake
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: true, // We just want to know if TLS is supported
+	})
+	
+	// Try the handshake - if it works, TLS is supported
+	err = tlsConn.Handshake()
+	if err := tlsConn.Close(); err != nil {
+		// TLS connection close error (ignored)
+		_ = err
+	}
+	
+	return err == nil
+}
+
 
 // isLocalNetwork checks if the target appears to be on local network
 func (app *ScreenshotApp) isLocalNetwork(host string) bool {
@@ -337,125 +471,43 @@ func (app *ScreenshotApp) isLocalNetwork(host string) bool {
 	return false
 }
 
-// doScreenshot performs the actual screenshot capture
-func (app *ScreenshotApp) doScreenshot(ctx context.Context, target ScreenshotTarget, opts *ScreenshotOptions, result *ScreenshotResult) error {
-	// Find Chrome executable
-	var execPath string
-	var err error
-
-	if opts.ChromePath != "" {
-		// Use user-specified Chrome path
-		if _, err := os.Stat(opts.ChromePath); err != nil {
-			return errors.WrapNetworkError("specified Chrome path not found", err)
+// doScreenshot performs the actual screenshot capture using the Chrome pool
+func (app *ScreenshotApp) doScreenshot(_ context.Context, target ScreenshotTarget, opts *ScreenshotOptions, result *ScreenshotResult) error {
+	// Get Chrome instance from pool
+	instance, err := app.ChromePool.Get()
+	if err != nil {
+		return errors.WrapNetworkError("failed to get Chrome instance from pool", err)
+	}
+	
+	// Return instance to pool when done
+	defer func() {
+		if putErr := app.ChromePool.Put(instance); putErr != nil {
+			app.logger.Warn("Failed to return Chrome instance to pool", "error", putErr)
 		}
-		execPath = opts.ChromePath
-	} else {
-		// Auto-detect Chrome
-		execPath, err = FindChromeExecutableWithOptions(opts.AutoDownload)
-		if err != nil {
-			return errors.WrapNetworkError("Chrome/Chromium not found", err)
-		}
+	}()
+	
+	// Navigate to the target URL
+	if err := instance.Navigate(target.URL); err != nil {
+		return errors.WrapNetworkError("failed to navigate to URL", err)
 	}
-
-	// Build Chrome allocator options
-	allocOptions := []chromedp.ExecAllocatorOption{
-		chromedp.ExecPath(execPath),
-		chromedp.NoSandbox,
-		chromedp.Headless,
-		chromedp.DisableGPU,
-		chromedp.WindowSize(opts.ViewportWidth, opts.ViewportHeight),
-		chromedp.UserAgent(opts.UserAgent),
+	
+	// Wait for the page to load (but with a shorter wait for failed connections)
+	time.Sleep(opts.WaitTime)
+	
+	// Take screenshot
+	screenshotData, err := instance.Screenshot()
+	if err != nil {
+		return errors.WrapNetworkError("failed to capture screenshot", err)
 	}
-
-	// Add SSL-related flags if SSL errors should be ignored
-	if opts.IgnoreSSLErrors {
-		allocOptions = append(allocOptions,
-			// Core SSL error ignoring
-			chromedp.Flag("ignore-certificate-errors", true),
-			chromedp.Flag("ignore-ssl-errors", true),
-			chromedp.Flag("ignore-certificate-errors-spki-list", true),
-			chromedp.Flag("ignore-certificate-errors-ssl-errors", true),
-			chromedp.Flag("allow-running-insecure-content", true),
-			chromedp.Flag("disable-web-security", true),
-
-			// Additional SSL/TLS error handling
-			chromedp.Flag("ignore-urlfetcher-cert-requests", true),
-			chromedp.Flag("disable-extensions", true),
-			chromedp.Flag("disable-plugins", true),
-			chromedp.Flag("disable-images", true),      // Reduce load, avoid mixed content issues
-			chromedp.Flag("disable-javascript", false), // Keep JS for dynamic content
-
-			// Network error tolerance
-			chromedp.Flag("aggressive-cache-discard", true),
-			chromedp.Flag("disable-background-networking", true),
-			chromedp.Flag("disable-background-timer-throttling", true),
-			chromedp.Flag("disable-renderer-backgrounding", true),
-			chromedp.Flag("disable-backgrounding-occluded-windows", true),
-
-			// SSL/TLS specific
-			chromedp.Flag("allow-insecure-localhost", true),
-			chromedp.Flag("disable-features", "VizDisplayCompositor"),
-		)
-	}
-
-	// Create Chrome context with configured options
-	allocCtx, cancel := chromedp.NewExecAllocator(ctx, allocOptions...)
-	defer cancel()
-
-	chromeCtx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-
-	// Generate filename
+	
+	// Generate filename and save screenshot
 	filename := app.generateFilename(target)
-	filepath := filepath.Join(opts.OutputDir, filename)
-	result.FilePath = filepath
-
-	var buf []byte
-
-	// Navigate and capture screenshot
-	tasks := chromedp.Tasks{
-		chromedp.Navigate(target.URL),
-		chromedp.Sleep(opts.WaitTime), // Wait for page to load
-	}
-
-	if opts.FullPage {
-		tasks = append(tasks, chromedp.FullScreenshot(&buf, 90))
-	} else {
-		tasks = append(tasks, chromedp.CaptureScreenshot(&buf))
-	}
-
-	if err := chromedp.Run(chromeCtx, tasks); err != nil {
-		// Check if this is an SSL error that we should handle gracefully
-		if opts.IgnoreSSLErrors && isSSLError(err) {
-			app.logger.Network("SSL error encountered, attempting fallback", "target", target.URL, "error", err.Error())
-
-			// Try a simpler approach - just navigate and wait longer
-			fallbackTasks := chromedp.Tasks{
-				chromedp.Navigate(target.URL),
-				chromedp.Sleep(opts.WaitTime * 2), // Wait longer for problematic sites
-			}
-
-			if opts.FullPage {
-				fallbackTasks = append(fallbackTasks, chromedp.FullScreenshot(&buf, 90))
-			} else {
-				fallbackTasks = append(fallbackTasks, chromedp.CaptureScreenshot(&buf))
-			}
-
-			if err := chromedp.Run(chromeCtx, fallbackTasks); err != nil {
-				return errors.WrapNetworkError("failed to capture screenshot after SSL fallback", err)
-			}
-
-			app.logger.Network("Screenshot captured despite SSL issues", "target", target.URL)
-		} else {
-			return errors.WrapNetworkError("failed to capture screenshot", err)
-		}
-	}
-
-	// Save screenshot to file
-	if err := os.WriteFile(filepath, buf, config.FilePermissions); err != nil {
+	result.FilePath = filepath.Join(opts.OutputDir, filename)
+	
+	if err := os.WriteFile(result.FilePath, screenshotData, 0644); err != nil {
 		return errors.WrapFileError("failed to save screenshot", err)
 	}
-
+	
 	return nil
 }
 
@@ -477,6 +529,7 @@ func ParseCIDR(cidr string, ports []int, protocols []string) ([]ScreenshotTarget
 	}
 
 	if len(protocols) == 0 {
+		// Smart protocol detection based on ports
 		protocols = []string{"http", "https"}
 	}
 
@@ -497,12 +550,11 @@ func ParseCIDR(cidr string, ports []int, protocols []string) ([]ScreenshotTarget
 		}
 
 		for _, port := range ports {
-			for _, protocol := range protocols {
-				// Skip invalid protocol/port combinations
-				if (protocol == "http" && port == 443) || (protocol == "https" && port == 80) {
-					continue
-				}
-
+			// Use the simpler priority-based approach for CIDR parsing
+			// TLS probing will happen later during actual screenshot attempts
+			portProtocols := getProtocolsForPort(port, protocols)
+			
+			for _, protocol := range portProtocols {
 				target := ScreenshotTarget{
 					Host:     ip.String(),
 					Port:     port,
@@ -517,13 +569,54 @@ func ParseCIDR(cidr string, ports []int, protocols []string) ([]ScreenshotTarget
 	return targets, nil
 }
 
+// getProtocolsForPort returns protocols in priority order (most likely first)
+func getProtocolsForPort(port int, requestedProtocols []string) []string {
+	// If specific protocols were requested, respect that
+	if len(requestedProtocols) > 0 && !contains(requestedProtocols, "http") && !contains(requestedProtocols, "https") {
+		return requestedProtocols
+	}
+	
+	// If only one protocol was requested, use it
+	if len(requestedProtocols) == 1 {
+		return requestedProtocols
+	}
+	
+	// For multiple protocols or default case, prioritize based on common usage
+	// but still try both - just in a smarter order
+	switch port {
+	case 80, 8080, 8000, 3000, 5000, 8888, 9000:
+		// HTTP is more likely first, but still try HTTPS
+		return []string{"http", "https"}
+	case 443, 8443, 8843:
+		// HTTPS is more likely first, but still try HTTP
+		return []string{"https", "http"}
+	default:
+		// For unknown ports, HTTP is statistically more common
+		return []string{"http", "https"}
+	}
+}
+
+// contains checks if a slice contains a string
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
 // ParseTargetsFromFile parses targets from a file
 func ParseTargetsFromFile(filename string) ([]ScreenshotTarget, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, errors.WrapFileError("failed to open targets file", err)
 	}
-	defer file.Close()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			fmt.Printf("Warning: failed to close targets file: %v\n", closeErr)
+		}
+	}()
 
 	var screenshotTargets []ScreenshotTarget
 	scanner := bufio.NewScanner(file)
@@ -668,12 +761,14 @@ func broadcast(ipNet *net.IPNet) net.IP {
 	return ip
 }
 
-// FindChromeExecutable attempts to find Chrome or Chromium executable with auto-download enabled
+// FindChromeExecutable attempts to find Chrome or Chromium executable
+// This function does not attempt to auto-download Chromium. Use FindChromeExecutableWithOptions(true) for that.
 func FindChromeExecutable() (string, error) {
-	return FindChromeExecutableWithOptions(true)
+	return FindChromeExecutableWithOptions(false)
 }
 
-// FindChromeExecutableWithOptions attempts to find Chrome or Chromium executable with configurable auto-download
+// FindChromeExecutableWithOptions attempts to find Chrome or Chromium executable
+// If autoDownload is true and no local installation is found, it will download a portable Chromium
 func FindChromeExecutableWithOptions(autoDownload bool) (string, error) {
 	// List of possible Chrome/Chromium executable names and paths
 	var candidates []string
@@ -732,16 +827,47 @@ func FindChromeExecutableWithOptions(autoDownload bool) (string, error) {
 		}
 	}
 
-	// If no Chrome/Chromium found, try to download portable Chromium (if enabled)
+	// If auto-download is enabled, check for cached Chromium first before downloading
 	if autoDownload {
-		return downloadPortableChromium()
+		// Check if we already have a cached Chromium
+		cacheDir, err := getCacheDir()
+		if err == nil {
+			chromiumDir := filepath.Join(cacheDir, "chromium")
+			var cachedExecutablePath string
+			
+			switch runtime.GOOS {
+			case "darwin":
+				cachedExecutablePath = filepath.Join(chromiumDir, "Chromium.app", "Contents", "MacOS", "Chromium")
+			case "linux":
+				cachedExecutablePath = filepath.Join(chromiumDir, "chrome")
+			case "windows":
+				cachedExecutablePath = filepath.Join(chromiumDir, "chrome.exe")
+			}
+			
+			// If cached Chromium exists, return it
+			if cachedExecutablePath != "" {
+				if _, err := os.Stat(cachedExecutablePath); err == nil {
+					// Optionally add debug info (commented out to keep output clean)
+					// fmt.Printf("Using cached Chromium: %s\n", cachedExecutablePath)
+					return cachedExecutablePath, nil
+				}
+			}
+		}
+		
+		// If no cached version found, download it
+		executablePath, err := downloadPortableChromium()
+		if err == nil {
+			return executablePath, nil
+		}
+		// If download fails, we'll fall through to the not found error
 	}
 
-	return "", fmt.Errorf("Chrome or Chromium executable not found. Please install Chrome/Chromium or ensure it's in your PATH. Tried: %v", append(pathCandidates, candidates...))
+	return "", fmt.Errorf("chrome or Chromium executable not found. Please install Chrome/Chromium or ensure it's in your PATH. Tried: %v", append(pathCandidates, candidates...))
 }
 
-// downloadPortableChromium downloads a portable Chromium binary to the cache directory
-func downloadPortableChromium() (string, error) {
+// isSSLError checks if the error is related to SSL/TLS certificate issues
+// downloadPortableChromium is a variable so we can mock it in tests
+var downloadPortableChromium = func() (string, error) {
 	// Get cache directory
 	cacheDir, err := getCacheDir()
 	if err != nil {
@@ -781,7 +907,7 @@ func downloadPortableChromium() (string, error) {
 
 	// Verify the executable exists after download
 	if _, err := os.Stat(executablePath); err != nil {
-		return "", fmt.Errorf("Chromium executable not found after download: %s", executablePath)
+		return "", fmt.Errorf("chromium executable not found after download: %s", executablePath)
 	}
 
 	// Make executable on Unix systems
@@ -818,13 +944,13 @@ func getCacheDir() (string, error) {
 		}
 	case "windows":
 		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
-			cacheDir = filepath.Join(localAppData, "sniffl", "cache")
+			cacheDir = filepath.Join(localAppData, "sniffl")
 		} else {
 			homeDir, err := os.UserHomeDir()
 			if err != nil {
 				return "", err
 			}
-			cacheDir = filepath.Join(homeDir, "AppData", "Local", "sniffl", "cache")
+			cacheDir = filepath.Join(homeDir, "AppData", "Local", "sniffl")
 		}
 	default:
 		return "", fmt.Errorf("unsupported platform: %s", runtime.GOOS)
@@ -845,24 +971,30 @@ func getChromiumDownloadURL() (string, error) {
 
 	switch runtime.GOOS {
 	case "linux":
-		if runtime.GOARCH == "amd64" {
+		switch runtime.GOARCH {
+		case "amd64":
 			return baseURL + "/Linux_x64/LAST_CHANGE", nil
+		default:
+			return "", fmt.Errorf("unsupported Linux architecture: %s", runtime.GOARCH)
 		}
-		return "", fmt.Errorf("unsupported Linux architecture: %s", runtime.GOARCH)
 	case "darwin":
-		if runtime.GOARCH == "amd64" {
+		switch runtime.GOARCH {
+		case "amd64":
 			return baseURL + "/Mac/LAST_CHANGE", nil
-		} else if runtime.GOARCH == "arm64" {
+		case "arm64":
 			return baseURL + "/Mac_Arm/LAST_CHANGE", nil
+		default:
+			return "", fmt.Errorf("unsupported macOS architecture: %s", runtime.GOARCH)
 		}
-		return "", fmt.Errorf("unsupported macOS architecture: %s", runtime.GOARCH)
 	case "windows":
-		if runtime.GOARCH == "amd64" {
+		switch runtime.GOARCH {
+		case "amd64":
 			return baseURL + "/Win_x64/LAST_CHANGE", nil
-		} else if runtime.GOARCH == "386" {
+		case "386":
 			return baseURL + "/Win/LAST_CHANGE", nil
+		default:
+			return "", fmt.Errorf("unsupported Windows architecture: %s", runtime.GOARCH)
 		}
-		return "", fmt.Errorf("unsupported Windows architecture: %s", runtime.GOARCH)
 	default:
 		return "", fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
@@ -878,7 +1010,12 @@ func downloadAndExtractChromium(lastChangeURL, targetDir string) error {
 	if err != nil {
 		return fmt.Errorf("failed to get latest Chromium revision: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			// Response body close error (ignored)
+			_ = err
+		}
+	}()
 
 	revisionBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -914,7 +1051,12 @@ func downloadAndExtractChromium(lastChangeURL, targetDir string) error {
 	if err != nil {
 		return fmt.Errorf("failed to download Chromium: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			// Response body close error (ignored)
+			_ = err
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("failed to download Chromium: HTTP %d", resp.StatusCode)
@@ -925,17 +1067,24 @@ func downloadAndExtractChromium(lastChangeURL, targetDir string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer os.Remove(tempFile.Name())
-	defer tempFile.Close()
+	defer func() {
+		if err := os.Remove(tempFile.Name()); err != nil {
+			// Temp file removal error (ignored)
+			_ = err
+		}
+	}()
+	defer func() {
+		if err := tempFile.Close(); err != nil {
+			// Temp file close error (ignored)
+			_ = err
+		}
+	}()
 
 	// Download to temp file
 	_, err = io.Copy(tempFile, resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to download Chromium archive: %w", err)
 	}
-
-	// Close temp file before extraction
-	tempFile.Close()
 
 	// Extract the zip file
 	fmt.Printf("Extracting Chromium...\n")
@@ -952,7 +1101,12 @@ func extractZip(src, dest string) error {
 	if err != nil {
 		return err
 	}
-	defer r.Close()
+	defer func() {
+		if err := r.Close(); err != nil {
+			// Reader close error (ignored)
+			_ = err
+		}
+	}()
 
 	// Create destination directory
 	if err := os.MkdirAll(dest, 0755); err != nil {
@@ -970,73 +1124,58 @@ func extractZip(src, dest string) error {
 
 		// Check for ZipSlip vulnerability
 		if !strings.HasPrefix(path, filepath.Clean(dest)+string(os.PathSeparator)) {
-			rc.Close()
+			if err := rc.Close(); err != nil {
+				// Reader close error (ignored)
+				_ = err
+			}
 			return fmt.Errorf("invalid file path: %s", f.Name)
 		}
 
 		if f.FileInfo().IsDir() {
-			os.MkdirAll(path, f.FileInfo().Mode())
-			rc.Close()
-			continue
-		}
+			if err := os.MkdirAll(path, f.FileInfo().Mode()); err != nil {
+				if err := rc.Close(); err != nil {
+					// Reader close error (ignored)
+					_ = err
+				}
+				return err
+			}
+		} else {
+			// Create file directory
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				if err := rc.Close(); err != nil {
+					// Reader close error (ignored)
+					_ = err
+				}
+				return err
+			}
 
-		// Create file directory
-		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-			rc.Close()
-			return err
-		}
+			// Create file
+			outFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.FileInfo().Mode())
+			if err != nil {
+				if err := rc.Close(); err != nil {
+					// Reader close error (ignored)
+					_ = err
+				}
+				return err
+			}
 
-		// Create file
-		outFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.FileInfo().Mode())
-		if err != nil {
-			rc.Close()
-			return err
-		}
+			// Copy with a size limit
+			_, err = io.CopyN(outFile, rc, 1024*1024*256) // Limit to 256MB to prevent zip bombs
+			if err := outFile.Close(); err != nil {
+				// Output file close error (ignored)
+				_ = err
+			}
+			if err := rc.Close(); err != nil {
+				// Reader close error (ignored)
+				_ = err
+			}
 
-		_, err = io.Copy(outFile, rc)
-		outFile.Close()
-		rc.Close()
-
-		if err != nil {
-			return err
+			if err != nil && err != io.EOF {
+				return err
+			}
 		}
 	}
 
 	return nil
 }
 
-// isSSLError checks if the error is related to SSL/TLS certificate issues
-func isSSLError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	errStr := err.Error()
-	sslErrors := []string{
-		"ERR_SSL_UNRECOGNIZED_NAME_ALERT",
-		"ERR_CERT_AUTHORITY_INVALID",
-		"ERR_CERT_COMMON_NAME_INVALID",
-		"ERR_CERT_DATE_INVALID",
-		"ERR_CERT_INVALID",
-		"ERR_SSL_PROTOCOL_ERROR",
-		"ERR_SSL_VERSION_OR_CIPHER_MISMATCH",
-		"ERR_CERT_UNABLE_TO_CHECK_REVOCATION",
-		"ERR_CERT_REVOKED",
-		"ERR_CERT_WEAK_SIGNATURE_ALGORITHM",
-		"ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN",
-		"ERR_CERT_SYMANTEC_LEGACY",
-		"net::ERR_CERT",
-		"net::ERR_SSL",
-		"certificate",
-		"ssl",
-		"tls",
-	}
-
-	for _, sslErr := range sslErrors {
-		if strings.Contains(strings.ToLower(errStr), strings.ToLower(sslErr)) {
-			return true
-		}
-	}
-
-	return false
-}

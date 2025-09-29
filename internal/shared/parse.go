@@ -29,9 +29,9 @@ const (
 	PortIMAPS = "993"
 	PortPOP3S = "995"
 	// HTTP/HTTPS ports
-	PortHTTPS     = "443"
-	PortHTTPAlt   = "8080"
-	PortHTTPSAlt  = "8443"
+	PortHTTPS    = "443"
+	PortHTTPAlt  = "8080"
+	PortHTTPSAlt = "8443"
 )
 
 // Target describes a destination as host:port with an optional protocol hint.
@@ -89,18 +89,23 @@ func IsValidHostPort(hp string) bool {
 // IsValidHostname validates that the host is either a valid IP address (v4/v6)
 // or a reasonable DNS hostname. It rejects control characters, whitespace,
 // slashes, and empty/oversized labels.
+// This function is security-critical as it prevents HTTP header injection attacks.
 func IsValidHostname(h string) bool {
+	// Reject empty or overly long hostnames
+	if len(h) == 0 || len(h) > MaxHostnameLength {
+		return false
+	}
+
 	// Accept IP literals (SplitHostPort removes IPv6 brackets).
 	if ip := net.ParseIP(h); ip != nil {
 		return true
 	}
+
 	// Reject obvious bad characters to prevent HTTP header/control injection.
 	if strings.ContainsAny(h, " \t\r\n/\\") {
 		return false
 	}
-	if len(h) == 0 || len(h) > MaxHostnameLength {
-		return false
-	}
+
 	labels := strings.Split(h, ".")
 	for _, l := range labels {
 		if l == "" || len(l) > MaxLabelLength {

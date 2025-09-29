@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -108,13 +109,48 @@ func showManPage(args []string) error {
 		}
 	}
 
-	// Try to use system man command first (if already installed)
-	if err := trySystemManCommand(commandName); err == nil {
-		return nil
+	// Windows doesn't have man pages - show help instead
+	if runtime.GOOS == "windows" {
+		return showWindowsHelp(args)
 	}
 
-	// If not available, auto-install and then show
+	// Resolve currently installed man page path (if any)
+	manPath, _ := resolveSystemManPagePath(commandName)
+
+	// If an installed page exists but is outdated, refresh by auto-installing latest
+	if manPath != "" {
+		upToDate, _ := isManPageUpToDate(manPath)
+		if upToDate {
+			// Use system man page as-is
+			if err := trySystemManCommand(commandName); err == nil {
+				return nil
+			}
+			// Fallback to direct display if man invocation fails
+			return displayManPageDirect(manPath)
+		}
+	}
+
+	// No page found or outdated → auto-install and show latest
 	return autoInstallAndShowManPage(commandName)
+}
+
+// showWindowsHelp provides Windows-friendly help display
+func showWindowsHelp(args []string) error {
+	// On Windows, show the help command instead of man pages
+	if len(args) == 0 {
+		// Show main help
+		return rootCmd.Help()
+	}
+	
+	// Show help for specific subcommand
+	subcommand := args[0]
+	for _, cmd := range rootCmd.Commands() {
+		if cmd.Name() == subcommand {
+			return cmd.Help()
+		}
+	}
+	
+	return errors.NewValidationError(fmt.Sprintf("unknown command: %s", args[0]))
 }
 
 // trySystemManCommand tries to use the already installed system man page
@@ -129,6 +165,37 @@ func trySystemManCommand(commandName string) error {
 	cmd.Stderr = os.Stderr
 
 	return cmd.Run()
+}
+
+// resolveSystemManPagePath attempts to locate the current man page file path for the given command
+func resolveSystemManPagePath(commandName string) (string, error) {
+	if _, err := exec.LookPath("man"); err != nil {
+		return "", err
+	}
+	cmd := exec.Command("man", "-w", commandName)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return "", fmt.Errorf("man path not found")
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		return "", statErr
+	}
+	return path, nil
+}
+
+// isManPageUpToDate checks whether a man page file contains the current binary version string
+func isManPageUpToDate(manFile string) (bool, error) {
+	data, err := os.ReadFile(manFile)
+	if err != nil {
+		return false, err
+	}
+	// Cobra GenMan uses header Source set to "sniffl <version>"
+	expected := "sniffl " + getVersion()
+	return strings.Contains(string(data), expected), nil
 }
 
 // autoInstallAndShowManPage automatically installs all man pages and shows the requested one
@@ -233,6 +300,11 @@ func displayWithPager(content string) error {
 			continue
 		}
 
+		// Validate pager name to prevent command injection
+		if !isValidPager(pager) {
+			continue
+		}
+
 		cmd := exec.Command(pager)
 		cmd.Stdin = strings.NewReader(content)
 		cmd.Stdout = os.Stdout
@@ -253,6 +325,18 @@ func displayWithPager(content string) error {
 	}
 
 	return fmt.Errorf("no suitable pager found")
+}
+
+// isValidPager validates that a pager name is safe to use in exec.Command
+func isValidPager(pager string) bool {
+	// Only allow known safe pager names
+	validPagers := []string{"less", "more", "cat"}
+	for _, validPager := range validPagers {
+		if pager == validPager {
+			return true
+		}
+	}
+	return false
 }
 
 func generateManPages(outputDir string) error {

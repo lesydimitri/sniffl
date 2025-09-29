@@ -10,16 +10,20 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lesydimitri/sniffl/internal/logging"
 	"github.com/lesydimitri/sniffl/internal/shared"
 )
+
 type Config struct {
-	ExportMode      string // "", "single", "bundle", "full_bundle"
-	DNSExport       io.Writer
-	HTTPSProxy      *url.URL
-	Verbose         bool
+	ExportMode string // "", "single", "bundle", "full_bundle"
+	DNSExport  io.Writer
+	HTTPSProxy *url.URL
+	Verbose    bool
+	// StrictVerify, when true, disables insecure TLS fallback and enforces certificate verification.
+	StrictVerify    bool
 	Concurrency     int // number of concurrent operations (default: 1 for sequential)
 	Out             io.Writer
 	Err             io.Writer
@@ -61,12 +65,17 @@ func (stdTLSFactory) Client(c net.Conn, cfg *tls.Config) TLSConn { return tls.Cl
 
 // App owns dependencies and state for a run.
 type App struct {
-	cfg        Config
-	dialer     Dialer
-	tlsFactory TLSClientFactory
-	logger     *logging.Logger
-	allCerts   []*x509.Certificate
-	dnsNames   map[string]struct{}
+	cfg              Config
+	dialer           Dialer
+	tlsFactory       TLSClientFactory
+	logger           *logging.Logger
+	state            *ConcurrentState  // Thread-safe shared state
+	errorHandler     *shared.ErrorHandler
+	caBundleOnce     sync.Once        // Ensure CA bundle is downloaded only once
+	caBundlePath     string           // Cached CA bundle path
+	caBundleErr      error            // Cached CA bundle error
+	processedTargets int64            // Atomic counter for processed targets
+	failedTargets    int64            // Atomic counter for failed targets
 }
 
 // New constructs an App with sensible defaults, applying any options.
@@ -76,14 +85,17 @@ func New(cfg Config, opts ...Option) *App {
 		dialer:     stdDialer{},
 		tlsFactory: stdTLSFactory{},
 		logger:     cfg.Logger,
-		dnsNames:   make(map[string]struct{}),
+		state:      NewConcurrentState(),
 	}
-	
+
 	// Fallback to a basic logger if none provided
 	if a.logger == nil {
 		a.logger = logging.New("info", "text", cfg.Err)
 	}
-	
+
+	// Initialize helper utilities
+	a.errorHandler = shared.NewErrorHandler(a.logger, cfg.Out)
+
 	for _, o := range opts {
 		o(a)
 	}
@@ -108,192 +120,291 @@ func WithLogger(l *logging.Logger) Option { return func(a *App) { a.logger = l }
 // Run processes targets and performs export per config.
 func (a *App) Run(ctx context.Context, targets []shared.Target) error {
 	a.logger.Info("Starting certificate check", "targets", len(targets), "concurrency", a.cfg.Concurrency)
-	
+
+	// Reset counters
+	atomic.StoreInt64(&a.processedTargets, 0)
+	atomic.StoreInt64(&a.failedTargets, 0)
+
+	// Validate targets before processing
+	validTargets := make([]shared.Target, 0, len(targets))
+	for _, target := range targets {
+		if err := a.validateTarget(target); err != nil {
+			_ = a.errorHandler.HandleValidationError(err.Error(), target.HostPort)
+			atomic.AddInt64(&a.failedTargets, 1)
+			continue
+		}
+		validTargets = append(validTargets, target)
+	}
+
+	if len(validTargets) == 0 {
+		a.logger.Warn("No valid targets to process", "total", len(targets), "failed", len(targets))
+		return nil // Don't fail completely, just warn
+	}
+
 	// Determine concurrency level (default to 1 if not set)
 	concurrency := a.cfg.Concurrency
 	if concurrency <= 0 {
 		concurrency = 1
 	}
-	
+
+	// Pre-warm CA bundle in concurrent mode to avoid race conditions
+	if concurrency > 1 {
+		a.ensureCABundleOnce(ctx)
+	}
+
 	// If concurrency is 1, use sequential processing for simplicity
 	if concurrency == 1 {
-		return a.runSequential(ctx, targets)
+		return a.runSequential(ctx, validTargets)
 	}
-	
+
 	// Use concurrent processing
-	return a.runConcurrent(ctx, targets, concurrency)
+	return a.runConcurrent(ctx, validTargets, concurrency)
+}
+
+// validateTarget performs comprehensive target validation
+func (a *App) validateTarget(target shared.Target) error {
+	if !shared.IsValidHostPort(target.HostPort) {
+		return fmt.Errorf("invalid host:port format")
+	}
+
+	host, port, err := net.SplitHostPort(target.HostPort)
+	if err != nil {
+		return fmt.Errorf("failed to parse host:port: %w", err)
+	}
+
+	// Validate host (allow private IPs for certificate checking)
+	if host == "" {
+		return fmt.Errorf("empty host")
+	}
+
+	// Validate port
+	if port == "" {
+		return fmt.Errorf("empty port")
+	}
+
+	// Validate protocol if specified
+	if target.Protocol != "" && !shared.SupportedProtocols[target.Protocol] {
+		return fmt.Errorf("unsupported protocol: %s", target.Protocol)
+	}
+
+	return nil
+}
+
+// ensureCABundleOnce ensures CA bundle is downloaded only once
+func (a *App) ensureCABundleOnce(ctx context.Context) {
+	a.caBundleOnce.Do(func() {
+		a.caBundlePath, a.caBundleErr = a.ensureCABundle(ctx)
+		if a.caBundleErr != nil {
+			a.logger.Warn("Failed to ensure CA bundle", "error", a.caBundleErr)
+		} else {
+			a.logger.Debug("CA bundle ready", "path", a.caBundlePath)
+		}
+	})
 }
 
 // runSequential processes targets one by one (original behavior)
 func (a *App) runSequential(ctx context.Context, targets []shared.Target) error {
 	for _, t := range targets {
+		if err := ctx.Err(); err != nil {
+			a.logger.Info("Context cancelled, stopping sequential processing")
+			break
+		}
+
 		if err := a.processTarget(ctx, t); err != nil {
+			a.logger.Warn("Failed to process target", "target", t.HostPort, "error", err)
+			atomic.AddInt64(&a.failedTargets, 1)
 			// Continue processing other targets even if one fails
 			continue
 		}
+		atomic.AddInt64(&a.processedTargets, 1)
 	}
-	
-	a.logger.Info("Finalizing export", "mode", a.cfg.ExportMode)
-	return a.finalizeExport(ctx)
+
+	return a.finalizeExportWithStats(ctx)
 }
 
 // runConcurrent processes targets concurrently with specified concurrency level
 func (a *App) runConcurrent(ctx context.Context, targets []shared.Target, concurrency int) error {
-	// Channel to send targets to workers
 	targetChan := make(chan shared.Target, len(targets))
-	
-	// WaitGroup to wait for all workers to complete
 	var wg sync.WaitGroup
 	
-	// Mutex to protect shared data (allCerts, dnsNames)
-	var mu sync.Mutex
-	
-	// Start worker goroutines
+	// Use a single output mutex for all output operations
+	var outputMu sync.Mutex
+
+	// Start workers
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			a.logger.Debug("Worker started", "worker_id", workerID)
-			
+
 			for target := range targetChan {
 				select {
 				case <-ctx.Done():
 					a.logger.Debug("Worker cancelled", "worker_id", workerID)
 					return
 				default:
-					// Process target and handle shared data access
-					if err := a.processTargetConcurrent(ctx, target, &mu); err != nil {
-						// Continue processing other targets even if one fails
+					if err := a.processTargetConcurrent(ctx, target, &outputMu); err != nil {
+						a.logger.Warn("Failed to process target", "target", target.HostPort, "error", err, "worker_id", workerID)
+						atomic.AddInt64(&a.failedTargets, 1)
 						continue
 					}
+					atomic.AddInt64(&a.processedTargets, 1)
 				}
 			}
-			
+
 			a.logger.Debug("Worker finished", "worker_id", workerID)
 		}(i)
 	}
-	
-	// Send all targets to the channel
+
+	// Send targets to workers
 	for _, target := range targets {
-		targetChan <- target
+		select {
+		case targetChan <- target:
+		case <-ctx.Done():
+			close(targetChan)
+			wg.Wait()
+			return ctx.Err()
+		}
 	}
 	close(targetChan)
-	
-	// Wait for all workers to complete
 	wg.Wait()
-	
-	a.logger.Info("Finalizing export", "mode", a.cfg.ExportMode)
-	return a.finalizeExport(ctx)
+
+	return a.finalizeExportWithStats(ctx)
 }
 
 // processTarget handles a single target (used by sequential processing)
 func (a *App) processTarget(ctx context.Context, t shared.Target) error {
 	targetLogger := a.logger.WithTarget(t.HostPort)
-	
-	if !shared.IsValidHostPort(t.HostPort) {
-		targetLogger.Warn("Invalid host:port format, skipping", "hostport", t.HostPort)
-		if _, err := fmt.Fprintf(a.cfg.Out, "[-] Invalid host:port format: %s (skipped)\n", t.HostPort); err != nil {
-			targetLogger.Warn("Failed to write output", "error", err)
-		}
-		return fmt.Errorf("invalid host:port format: %s", t.HostPort)
-	}
-	
+
 	host, port, _ := net.SplitHostPort(t.HostPort)
 	proto := a.resolveProtocol(t.Protocol, port)
 	protocolLogger := targetLogger.WithProtocol(proto)
-	
+
 	protocolLogger.Debug("Processing target", "host", host, "port", port)
-	
+
 	certs, err := a.fetchCertsByProtocol(ctx, proto, host, port, t.HostPort)
 	if err != nil {
-		protocolLogger.Failure("Failed to fetch certificates", "error", err)
-		if _, writeErr := fmt.Fprintf(a.cfg.Out, "[-] Failed to fetch certificates from %s using %s protocol: %v\n", t.HostPort, proto, err); writeErr != nil {
-			protocolLogger.Warn("Failed to write output", "error", writeErr)
-		}
-		return err
+		return a.errorHandler.HandleNetworkError(fmt.Sprintf("Certificate fetch from %s using %s protocol", t.HostPort, proto), t.HostPort, err)
 	}
-	
+
 	protocolLogger.Success("Successfully fetched certificates", "count", len(certs))
-	a.displayCertReport(t.HostPort, certs)
-	a.recordDNSNames(certs)
-	
-	if a.cfg.ExportMode == "single" {
-		if err := a.exportCertsSingle(certs, host); err != nil {
-			protocolLogger.Failure("Failed to export certificates", "error", err)
-			if _, writeErr := fmt.Fprintf(a.cfg.Out, "[-] Failed to export certificates for %s: %v\n", t.HostPort, err); writeErr != nil {
-				protocolLogger.Warn("Failed to write output", "error", writeErr)
-			}
-			return err
-		}
+	if err := a.DisplayCertificateReport(t.HostPort, certs); err != nil {
+		a.logger.Warn("Failed to display certificate report", "target", t.HostPort, "error", err)
 	}
-	if a.cfg.ExportMode == "bundle" || a.cfg.ExportMode == "full_bundle" {
-		a.allCerts = append(a.allCerts, certs...)
-	}
-	
+
+	// Process certificates for export and DNS collection
+	a.processCertificates(certs, host)
+
 	return nil
 }
 
-// processTargetConcurrent handles a single target with mutex protection for shared data
-func (a *App) processTargetConcurrent(ctx context.Context, t shared.Target, mu *sync.Mutex) error {
+// processTargetConcurrent handles a single target in concurrent mode
+func (a *App) processTargetConcurrent(ctx context.Context, t shared.Target, outputMu *sync.Mutex) error {
 	targetLogger := a.logger.WithTarget(t.HostPort)
-	
-	if !shared.IsValidHostPort(t.HostPort) {
-		targetLogger.Warn("Invalid host:port format, skipping", "hostport", t.HostPort)
-		// Protect output writing with mutex
-		mu.Lock()
-		if _, err := fmt.Fprintf(a.cfg.Out, "[-] Invalid host:port format: %s (skipped)\n", t.HostPort); err != nil {
-			targetLogger.Warn("Failed to write output", "error", err)
-		}
-		mu.Unlock()
-		return fmt.Errorf("invalid host:port format: %s", t.HostPort)
-	}
-	
+
 	host, port, _ := net.SplitHostPort(t.HostPort)
 	proto := a.resolveProtocol(t.Protocol, port)
 	protocolLogger := targetLogger.WithProtocol(proto)
-	
+
 	protocolLogger.Debug("Processing target", "host", host, "port", port)
-	
+
+	// Fetch certificates without holding any locks
 	certs, err := a.fetchCertsByProtocol(ctx, proto, host, port, t.HostPort)
 	if err != nil {
-		protocolLogger.Failure("Failed to fetch certificates", "error", err)
-		// Protect output writing with mutex
-		mu.Lock()
-		if _, writeErr := fmt.Fprintf(a.cfg.Out, "[-] Failed to fetch certificates from %s using %s protocol: %v\n", t.HostPort, proto, err); writeErr != nil {
-			protocolLogger.Warn("Failed to write output", "error", writeErr)
-		}
-		mu.Unlock()
-		return err
+		// Protect output writing with dedicated mutex
+		outputMu.Lock()
+		handledErr := a.errorHandler.HandleNetworkError(fmt.Sprintf("Certificate fetch from %s using %s protocol", t.HostPort, proto), t.HostPort, err)
+		outputMu.Unlock()
+		return handledErr
 	}
-	
+
 	protocolLogger.Success("Successfully fetched certificates", "count", len(certs))
-	
-	// Protect shared data access with mutex
-	mu.Lock()
-	a.displayCertReport(t.HostPort, certs)
-	a.recordDNSNames(certs)
-	
-	if a.cfg.ExportMode == "single" {
-		if err := a.exportCertsSingle(certs, host); err != nil {
-			protocolLogger.Failure("Failed to export certificates", "error", err)
-			if _, writeErr := fmt.Fprintf(a.cfg.Out, "[-] Failed to export certificates for %s: %v\n", t.HostPort, err); writeErr != nil {
-				protocolLogger.Warn("Failed to write output", "error", writeErr)
-			}
-			mu.Unlock()
-			return err
-		}
+
+	// Protect output operations
+	outputMu.Lock()
+	if err := a.DisplayCertificateReport(t.HostPort, certs); err != nil {
+		a.logger.Warn("Failed to display certificate report", "target", t.HostPort, "error", err)
 	}
-	if a.cfg.ExportMode == "bundle" || a.cfg.ExportMode == "full_bundle" {
-		a.allCerts = append(a.allCerts, certs...)
-	}
-	mu.Unlock()
-	
+	outputMu.Unlock()
+
+	// Process certificates for export and DNS collection (thread-safe)
+	a.processCertificates(certs, host)
+
 	return nil
 }
 
+// processCertificates handles certificate processing for both sequential and concurrent modes
+func (a *App) processCertificates(certs []*x509.Certificate, host string) {
+	// Export single certificates if requested
+	if a.cfg.ExportMode == "single" {
+		if err := a.exportCertsSingle(certs, host); err != nil {
+			a.logger.Warn("Failed to export certificates", "host", host, "error", err)
+		}
+	}
+
+	// Add to bundle if requested
+	if a.cfg.ExportMode == "bundle" || a.cfg.ExportMode == "full_bundle" {
+		a.state.AddCertificates(certs)
+	}
+	
+	// Record DNS names from certificates (only once)
+	a.state.AddDNSNames(certs)
+}
+
+// resolveProtocol resolves the protocol with better fallback logic
 func (a *App) resolveProtocol(proto, port string) string {
 	if proto != "" && shared.SupportedProtocols[proto] {
 		return proto
 	}
-	return shared.GuessProtocol(port)
+	
+	// Enhanced protocol guessing with fallback
+	guessed := shared.GuessProtocol(port)
+	if guessed != "none" {
+		return guessed
+	}
+	
+	// Default fallback based on common ports
+	switch port {
+	case "443", "8443":
+		return "none" // Direct TLS
+	case "80", "8080", "8000":
+		return "http"
+	case "25", "587":
+		return "smtp"
+	case "143", "993":
+		return "imap"
+	case "110", "995":
+		return "pop3"
+	default:
+		return "none" // Default to direct TLS
+	}
+}
+
+// finalizeExportWithStats finalizes export and reports statistics
+func (a *App) finalizeExportWithStats(ctx context.Context) error {
+	processed := atomic.LoadInt64(&a.processedTargets)
+	failed := atomic.LoadInt64(&a.failedTargets)
+	
+	a.logger.Info("Processing complete", 
+		"processed", processed, 
+		"failed", failed, 
+		"success_rate", fmt.Sprintf("%.1f%%", float64(processed)/float64(processed+failed)*100))
+
+	a.logger.Info("Finalizing export", "mode", a.cfg.ExportMode)
+	return a.finalizeExport(ctx)
+}
+
+// GetAllCertificates returns all collected certificates (for testing)
+func (a *App) GetAllCertificates() []*x509.Certificate {
+	return a.state.GetAllCertificates()
+}
+
+// GetDNSNames returns all collected DNS names (for testing)
+func (a *App) GetDNSNames() []string {
+	return a.state.GetDNSNames()
+}
+
+// GetProcessingStats returns processing statistics
+func (a *App) GetProcessingStats() (processed, failed int64) {
+	return atomic.LoadInt64(&a.processedTargets), atomic.LoadInt64(&a.failedTargets)
 }

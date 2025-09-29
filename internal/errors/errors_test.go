@@ -13,13 +13,13 @@ func TestSnifflError_Error(t *testing.T) {
 		expected string
 	}{
 		{
-			name: "error without cause",
-			err:  New(ValidationError, "invalid input"),
+			name:     "error without cause",
+			err:      New(ValidationError, "invalid input"),
 			expected: "validation error: invalid input",
 		},
 		{
-			name: "error with cause",
-			err:  Wrap(NetworkError, "connection failed", fmt.Errorf("timeout")),
+			name:     "error with cause",
+			err:      Wrap(NetworkError, "connection failed", fmt.Errorf("timeout")),
 			expected: "network error: connection failed: timeout",
 		},
 	}
@@ -36,11 +36,11 @@ func TestSnifflError_Error(t *testing.T) {
 func TestSnifflError_Unwrap(t *testing.T) {
 	cause := fmt.Errorf("original error")
 	err := Wrap(TLSError, "wrapped error", cause)
-	
+
 	if unwrapped := err.Unwrap(); unwrapped != cause {
 		t.Errorf("SnifflError.Unwrap() = %v, want %v", unwrapped, cause)
 	}
-	
+
 	// Test error without cause
 	errNoCause := New(ValidationError, "no cause")
 	if unwrapped := errNoCause.Unwrap(); unwrapped != nil {
@@ -51,12 +51,12 @@ func TestSnifflError_Unwrap(t *testing.T) {
 func TestSnifflError_WithContext(t *testing.T) {
 	err := New(FileError, "file not found")
 	_ = err.WithContext("path", "/tmp/test.txt") //nolint:errcheck
-	_ = err.WithContext("operation", "read") //nolint:errcheck
-	
+	_ = err.WithContext("operation", "read")     //nolint:errcheck
+
 	if err.Context["path"] != "/tmp/test.txt" {
 		t.Errorf("Context[path] = %v, want /tmp/test.txt", err.Context["path"])
 	}
-	
+
 	if err.Context["operation"] != "read" {
 		t.Errorf("Context[operation] = %v, want read", err.Context["operation"])
 	}
@@ -87,7 +87,7 @@ func TestConvenienceConstructors(t *testing.T) {
 
 func TestWrapConvenienceConstructors(t *testing.T) {
 	cause := fmt.Errorf("original")
-	
+
 	tests := []struct {
 		name     string
 		err      *SnifflError
@@ -119,11 +119,11 @@ func TestIsNetworkTimeout(t *testing.T) {
 		Op:  "dial",
 		Err: &timeoutError{},
 	}
-	
+
 	if !IsNetworkTimeout(timeoutErr) {
 		t.Error("IsNetworkTimeout should return true for timeout error")
 	}
-	
+
 	// Test with non-timeout error
 	regularErr := fmt.Errorf("regular error")
 	if IsNetworkTimeout(regularErr) {
@@ -136,11 +136,11 @@ func TestIsConnectionRefused(t *testing.T) {
 	dialErr := &net.OpError{
 		Op: "dial",
 	}
-	
+
 	if !IsConnectionRefused(dialErr) {
 		t.Error("IsConnectionRefused should return true for dial error")
 	}
-	
+
 	// Test with non-dial error
 	readErr := &net.OpError{
 		Op: "read",
@@ -148,7 +148,7 @@ func TestIsConnectionRefused(t *testing.T) {
 	if IsConnectionRefused(readErr) {
 		t.Error("IsConnectionRefused should return false for read error")
 	}
-	
+
 	// Test with regular error
 	regularErr := fmt.Errorf("regular error")
 	if IsConnectionRefused(regularErr) {

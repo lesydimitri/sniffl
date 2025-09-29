@@ -5,9 +5,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/spf13/cobra"
 	"github.com/lesydimitri/sniffl/internal/config"
 	"github.com/lesydimitri/sniffl/internal/errors"
+	"github.com/spf13/cobra"
 )
 
 var configCmd = &cobra.Command{
@@ -52,7 +52,7 @@ func init() {
 
 func runConfigInit(cmd *cobra.Command, args []string) error {
 	logger := GetLogger()
-	
+
 	var configPath string
 	if len(args) > 0 {
 		configPath = args[0]
@@ -63,30 +63,30 @@ func runConfigInit(cmd *cobra.Command, args []string) error {
 		}
 		configPath = filepath.Join(home, ".sniffl.yaml")
 	}
-	
+
 	// Check if file already exists
 	if _, err := os.Stat(configPath); err == nil {
 		return errors.NewConfigError(fmt.Sprintf("configuration file already exists: %s", configPath))
 	}
-	
+
 	// Create default config
 	cfg := config.DefaultConfig()
-	
+
 	// Save to file
 	if err := cfg.SaveConfig(configPath); err != nil {
 		return errors.WrapConfigError("failed to create configuration file", err)
 	}
-	
+
 	logger.Success("Configuration file created", "path", configPath)
 	fmt.Printf("Configuration file created at: %s\n", configPath)
 	fmt.Println("You can now edit this file to customize your settings.")
-	
+
 	return nil
 }
 
 func runConfigShow(cmd *cobra.Command, args []string) error {
 	cfg := GetConfig()
-	
+
 	fmt.Println("Current Configuration:")
 	fmt.Printf("  Verbose: %t\n", cfg.Verbose)
 	fmt.Printf("  Timeout: %s\n", cfg.Timeout)
@@ -99,7 +99,9 @@ func runConfigShow(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  CT Show Expired: %t\n", cfg.CTShowExpired)
 	fmt.Printf("  Log Level: %s\n", cfg.LogLevel)
 	fmt.Printf("  Log Format: %s\n", cfg.LogFormat)
-	
+	fmt.Printf("  Output Dir Permissions: %04o\n", cfg.OutputDirPermissions)
+	fmt.Printf("  Output File Permissions: %04o\n", cfg.OutputFilePermissions)
+
 	return nil
 }
 

@@ -11,6 +11,18 @@
 # Build output directory
 dist/
 
+# Output directory for screenshots
+screenshots/
+
+# Output directory for certificates
+certificates/
+
+# Output directory for DNS
+dns/
+
+# Manual pages
+man/
+
 # Test binary, built with `go test -c`
 *.test
 

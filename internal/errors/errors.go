@@ -1,4 +1,3 @@
-// Package errors provides standardized error types for sniffl
 package errors
 
 import (

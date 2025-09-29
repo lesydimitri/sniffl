@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,13 +22,8 @@ var checkCmd = &cobra.Command{
 	Long: `Check certificates from live servers using various protocols.
 
 You can either specify a single host:port or use --file to check multiple targets.`,
-	Example: `  # Check a single SMTP server
-  sniffl check smtp.gmail.com:587 --protocol smtp --export bundle
-
-  # Check multiple targets from file
-  sniffl check --file targets.txt --export full_bundle --export-dns domains.txt
-
-  # Use HTTP proxy
+	Example: `  sniffl check smtp.gmail.com:587 --protocol smtp --export bundle
+  sniffl check --file targets.txt --export full_bundle --export-dns
   sniffl check example.com:443 --https-proxy http://proxy.example.com:8080`,
 	RunE: runCheck,
 }
@@ -36,20 +32,21 @@ var (
 	checkFile       string
 	checkProtocol   string
 	checkExport     string
-	checkExportDNS  string
+	checkExportDNS  bool
 	checkHTTPSProxy string
 	checkDryRun     bool
+	checkStrict     bool
 )
 
 func init() {
 	checkCmd.Flags().StringVarP(&checkFile, "file", "f", "", "file with targets (host:port [protocol])")
 	checkCmd.Flags().StringVarP(&checkProtocol, "protocol", "p", "", "connection protocol (smtp|imap|pop3|http|none, auto-detected if omitted)")
 	checkCmd.Flags().StringVarP(&checkExport, "export", "e", "", "export certificates (single|bundle|full_bundle)")
-	checkCmd.Flags().StringVar(&checkExportDNS, "export-dns", "", "file to write DNS names")
+	checkCmd.Flags().BoolVar(&checkExportDNS, "export-dns", false, "export DNS names to EXPORT_DIR/dns with timestamped filename")
 	checkCmd.Flags().StringVar(&checkHTTPSProxy, "https-proxy", "", "HTTP proxy URL")
 	checkCmd.Flags().BoolVar(&checkDryRun, "dry-run", false, "show what would be done without executing")
+	checkCmd.Flags().BoolVar(&checkStrict, "strict", false, "enforce strict TLS verification and do not use insecure fallback")
 
-	// Mark file and positional args as mutually exclusive
 	checkCmd.MarkFlagsMutuallyExclusive("file", "protocol")
 }
 
@@ -58,7 +55,6 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	cfg := GetConfig()
 	ctx := GetContext()
 
-	// Validate arguments
 	if checkFile == "" && len(args) != 1 {
 		return errors.NewValidationError("specify either a host:port or --file, not both")
 	}
@@ -67,27 +63,23 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		return errors.NewValidationError("when using --file, don't specify a host:port")
 	}
 
-	// Validate export mode
 	if checkExport != "" && checkExport != "single" && checkExport != "bundle" && checkExport != "full_bundle" {
 		return errors.NewValidationError("invalid export mode: must be single, bundle, or full_bundle")
 	}
 
-	// Validate protocol
 	if checkProtocol != "" && !shared.SupportedProtocols[checkProtocol] {
 		return errors.NewValidationError("invalid protocol: must be smtp, imap, pop3, http, or none")
 	}
 
-	// Protocol flag is only valid with single host, not with file
 	if checkProtocol != "" && checkFile != "" {
 		return errors.NewValidationError("--protocol flag is only valid with single host, not with --file")
 	}
-
-	// Parse proxy URL if provided
 	var proxyURL *url.URL
+	// Validate proxy URL
 	if checkHTTPSProxy != "" {
 		u, err := url.Parse(checkHTTPSProxy)
-		if err != nil {
-			return errors.WrapValidationError("invalid https-proxy", err)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return errors.NewValidationError("invalid https-proxy URL: must be a valid URL with scheme and host")
 		}
 		proxyURL = u
 	}
@@ -102,8 +94,8 @@ func runCheck(cmd *cobra.Command, args []string) error {
 			return errors.WrapFileError(fmt.Sprintf("failed to open targets file %s", checkFile), e)
 		}
 		defer func() {
-			if err := f.Close(); err != nil {
-				logger.Failure("Failed to close targets file", "error", err)
+			if closeErr := f.Close(); closeErr != nil {
+				logger.Warn("Failed to close targets file", "path", checkFile, "error", closeErr)
 			}
 		}()
 		targets, err = shared.ParseTargets(f, "")
@@ -121,22 +113,42 @@ func runCheck(cmd *cobra.Command, args []string) error {
 
 	// Show dry-run information
 	if checkDryRun {
-		return showDryRun(targets, checkExport, checkExportDNS, proxyURL)
+		showDryRun(targets, checkExport, checkExportDNS, proxyURL)
+		return nil
 	}
 
-	// Setup DNS export file
-	var dnsFile *os.File
-	if checkExportDNS != "" {
-		f, err := os.Create(checkExportDNS)
-		if err != nil {
-			return errors.WrapFileError("cannot create DNS export file", err)
-		}
-		defer func() {
-			if err := f.Close(); err != nil {
-				logger.Failure("Failed to close DNS export file", "error", err)
+	// Setup DNS export writer
+	var dnsWriter io.Writer
+	var dnsPath string
+	if checkExportDNS {
+		fileManager := shared.NewFileManager(cfg.OutputDirPermissions, cfg.OutputFilePermissions)
+		
+		// Determine base name: single target host or targets file name
+		var base string
+		if checkFile != "" {
+			base = strings.TrimSuffix(filepath.Base(checkFile), filepath.Ext(checkFile))
+		} else {
+			// single target mode; extract host safely from args[0]
+			hostPort := args[0]
+			if shared.IsValidHostPort(hostPort) {
+				if h, _, err := net.SplitHostPort(hostPort); err == nil {
+					base = h
+				} else {
+					base = strings.ReplaceAll(hostPort, ":", "_")
+				}
+			} else {
+				base = strings.ReplaceAll(hostPort, ":", "_")
 			}
-		}()
-		dnsFile = f
+		}
+		
+		filename := fmt.Sprintf("%s_dns.txt", base)
+		f, path, err := fileManager.CreateTimestampedFile(cfg.ExportDir, "dns", filename)
+		if err != nil {
+			return err
+		}
+		dnsPath = path
+		defer fileManager.SafeCloseFile(f, dnsPath, logger)
+		dnsWriter = f
 	}
 
 	// Override config with command line options
@@ -149,33 +161,28 @@ func runCheck(cmd *cobra.Command, args []string) error {
 
 	// Create check configuration
 	checkCfg := check.Config{
-		ExportMode:  cfg.ExportMode,
-		DNSExport:   dnsFile,
-		HTTPSProxy:  proxyURL,
-		Verbose:     cfg.Verbose,
-		Concurrency: cfg.Concurrency,
-		Out:         os.Stdout,
-		Err:         os.Stderr,
-		HTTPClient:  nil,
-		Logger:      logger,
+		ExportMode:   cfg.ExportMode,
+		DNSExport:    dnsWriter,
+		HTTPSProxy:   proxyURL,
+		Verbose:      cfg.Verbose,
+		StrictVerify: checkStrict,
+		Concurrency:  cfg.Concurrency,
+		Out:          os.Stdout,
+		Err:          os.Stderr,
+		HTTPClient:   nil,
+		Logger:       logger,
 		FileCreator: func(name string) (io.WriteCloser, error) {
-			// Join with export directory if specified
-			filePath := name
-			if cfg.ExportDir != "" && cfg.ExportDir != "." {
-				filePath = filepath.Join(cfg.ExportDir, name)
+			fileManager := shared.NewFileManager(cfg.OutputDirPermissions, cfg.OutputFilePermissions)
+			
+			// Absolute paths (e.g., cache files) are respected as-is
+			if filepath.IsAbs(name) {
+				return fileManager.CreateFile(name)
 			}
 
-			// ensure parent dirs
-			if dir := filepath.Dir(filePath); dir != "." {
-				if err := os.MkdirAll(dir, 0o755); err != nil {
-					return nil, errors.WrapFileError(fmt.Sprintf("failed to create directory %s", dir), err)
-				}
-			}
-			file, err := os.Create(filePath)
-			if err != nil {
-				return nil, errors.WrapFileError(fmt.Sprintf("failed to create file %s", filePath), err)
-			}
-			return file, nil
+			// Certificates: EXPORT_DIR/certificates with timestamped filename
+			base := filepath.Base(name)
+			f, _, err := fileManager.CreateTimestampedFile(cfg.ExportDir, "certificates", base)
+			return f, err
 		},
 	}
 
@@ -200,11 +207,14 @@ func runCheck(cmd *cobra.Command, args []string) error {
 
 	// Concise stdout success message
 	fmt.Println("Certificate check completed successfully")
+	if dnsPath != "" {
+		fmt.Printf("[+] Exported DNS names: %s\n", dnsPath)
+	}
 	logger.Success("Certificate check completed successfully")
 	return nil
 }
 
-func showDryRun(targets []shared.Target, exportMode, exportDNS string, proxyURL *url.URL) error {
+func showDryRun(targets []shared.Target, exportMode string, exportDNS bool, proxyURL *url.URL) {
 	fmt.Println("=== DRY RUN MODE ===")
 	fmt.Printf("Would process %d target(s):\n", len(targets))
 
@@ -220,8 +230,12 @@ func showDryRun(targets []shared.Target, exportMode, exportDNS string, proxyURL 
 		fmt.Printf("Would export certificates in '%s' mode\n", exportMode)
 	}
 
-	if exportDNS != "" {
-		fmt.Printf("Would export DNS names to: %s\n", exportDNS)
+	if exportDNS {
+		if len(targets) == 1 {
+			fmt.Println("Would export DNS names to: EXPORT_DIR/dns/<timestamp>_<host>_dns.txt")
+		} else {
+			fmt.Println("Would export DNS names to: EXPORT_DIR/dns/<timestamp>_<targets-file>_dns.txt")
+		}
 	}
 
 	if proxyURL != nil {
@@ -229,5 +243,4 @@ func showDryRun(targets []shared.Target, exportMode, exportDNS string, proxyURL 
 	}
 
 	fmt.Println("=== END DRY RUN ===")
-	return nil
 }

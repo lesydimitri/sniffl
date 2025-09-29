@@ -18,9 +18,8 @@ var screenshotCmd = &cobra.Command{
 	Long: `Capture screenshots of HTTP/HTTPS pages from various sources.
 
 REQUIREMENTS:
-This command requires Chrome or Chromium to be installed. If not found, sniffl can automatically 
-download a portable Chromium binary (enabled by default). Use 'sniffl screenshot check-chrome' 
-to verify your installation or disable auto-download with --auto-download=false.
+This command requires Chrome or Chromium to be installed. You can verify your installation
+by using 'sniffl screenshot check-chrome'.
 
 You can specify:
 - A single URL (http://example.com or https://example.com:8443)
@@ -44,8 +43,8 @@ For CIDR scanning, you can specify which ports to scan and protocols to use.`,
   # Scan with custom options
   sniffl screenshot --cidr 10.0.0.0/24 --ports 80,443 --timeout 15s --concurrency 10
 
-  # Disable auto-download (manual Chrome installation required)
-  sniffl screenshot https://example.com --auto-download=false`,
+  # Use a custom Chrome/Chromium path
+  sniffl screenshot https://example.com --chrome-path=/usr/bin/chromium`,
 	RunE: runScreenshot,
 }
 
@@ -63,9 +62,8 @@ var (
 	screenshotUserAgent     string
 	screenshotDryRun        bool
 	screenshotChromePath    string
-	screenshotAutoDownload  bool
 	screenshotSkipPortCheck bool
-	screenshotIgnoreSSL     bool
+	screenshotStrict        bool
 )
 
 func init() {
@@ -81,9 +79,8 @@ func init() {
 	screenshotCmd.Flags().StringVar(&screenshotViewport, "viewport", "1920x1080", "viewport size (WIDTHxHEIGHT)")
 	screenshotCmd.Flags().StringVar(&screenshotUserAgent, "user-agent", "", "custom user agent string")
 	screenshotCmd.Flags().StringVar(&screenshotChromePath, "chrome-path", "", "path to Chrome/Chromium executable")
-	screenshotCmd.Flags().BoolVar(&screenshotAutoDownload, "auto-download", true, "automatically download Chromium if not found")
 	screenshotCmd.Flags().BoolVar(&screenshotSkipPortCheck, "skip-port-check", false, "skip initial port connectivity check (faster but may waste time on unreachable targets)")
-	screenshotCmd.Flags().BoolVar(&screenshotIgnoreSSL, "ignore-ssl-errors", true, "ignore SSL certificate errors (useful for self-signed certificates)")
+	screenshotCmd.Flags().BoolVar(&screenshotStrict, "strict", false, "enforce strict TLS verification and do not ignore SSL errors")
 	screenshotCmd.Flags().BoolVar(&screenshotDryRun, "dry-run", false, "show what would be done without executing")
 
 	// Mark flags as mutually exclusive
@@ -104,22 +101,9 @@ func runScreenshot(cmd *cobra.Command, args []string) error {
 		return errors.NewValidationError("cannot specify both positional argument and --file/--cidr flags")
 	}
 
-	// Parse screenshot options
-	opts, err := parseScreenshotOptions()
-	if err != nil {
-		return err
-	}
-
-	if screenshotDryRun {
-		opts.DryRun = true
-		logger.Info("Dry run mode enabled - no screenshots will be captured")
-	}
-
-	// Create screenshot app
-	app := screenshot.NewScreenshotApp(cfg, logger)
-
 	// Parse targets based on input method
 	var targets []screenshot.ScreenshotTarget
+	var err error
 
 	switch {
 	case len(args) > 0:
@@ -161,6 +145,29 @@ func runScreenshot(cmd *cobra.Command, args []string) error {
 		return errors.NewValidationError("no valid targets found")
 	}
 
+	// Parse screenshot options
+	opts, err := parseScreenshotOptions()
+	if err != nil {
+		return err
+	}
+
+	// Apply adaptive concurrency
+	concurrencyManager := screenshot.NewAdaptiveConcurrencyManager()
+	recommendedConcurrency := concurrencyManager.GetScreenshotConcurrency(len(targets))
+	if opts.Concurrency > recommendedConcurrency {
+		logger.Info("Reducing concurrency to system-recommended level", "requested", opts.Concurrency, "recommended", recommendedConcurrency)
+		opts.Concurrency = recommendedConcurrency
+	}
+
+	if screenshotDryRun {
+		opts.DryRun = true
+		logger.Info("Dry run mode enabled - no screenshots will be captured")
+	}
+
+	// Create screenshot app
+	app := screenshot.NewScreenshotApp(cfg, logger)
+	// Note: No explicit Close method exists, Chrome pool cleanup is handled automatically
+
 	// Print concise stdout summary always
 	fmt.Printf("Starting screenshot operation: %d target(s), output=%s, concurrency=%d, timeout=%s, dry-run=%t\n",
 		len(targets), opts.OutputDir, opts.Concurrency, opts.Timeout, opts.DryRun)
@@ -182,6 +189,96 @@ func runScreenshot(cmd *cobra.Command, args []string) error {
 	printScreenshotSummary(results, logger)
 
 	return nil
+}
+
+func printScreenshotSummary(results []screenshot.ScreenshotResult, logger *logging.Logger) {
+	var successes, failures int
+	var totalDuration time.Duration
+
+	for _, result := range results {
+		totalDuration += result.Duration
+		if result.Success {
+			successes++
+		} else {
+			failures++
+		}
+	}
+
+	avgDuration := time.Duration(0)
+	if len(results) > 0 {
+		avgDuration = totalDuration / time.Duration(len(results))
+	}
+
+	// Always print concise stdout summary
+	fmt.Printf("Summary: total=%d, successes=%d, failures=%d, total_duration=%s, avg_duration=%s\n",
+		len(results), successes, failures, totalDuration.Round(time.Millisecond), avgDuration.Round(time.Millisecond))
+
+	logger.Info("Screenshot Summary",
+		"total", len(results),
+		"successes", successes,
+		"failures", failures,
+		"total_duration", totalDuration.Round(time.Millisecond),
+		"avg_duration", avgDuration.Round(time.Millisecond))
+
+	// Show first few failures for debugging
+	failureCount := 0
+	for _, result := range results {
+		if !result.Success && failureCount < 5 {
+			logger.Failure("Screenshot failed", "target", result.Target.URL, "error", result.Error)
+			failureCount++
+		}
+	}
+
+	if failures > 5 {
+		logger.Info("Additional failures not shown", "count", failures-5)
+	}
+} // End of runScreenshot function
+
+func parsePorts(portsStr string) ([]int, error) {
+	if portsStr == "" {
+		return []int{80, 443}, nil
+	}
+
+	portStrs := strings.Split(portsStr, ",")
+	ports := make([]int, 0, len(portStrs))
+
+	for _, portStr := range portStrs {
+		portStr = strings.TrimSpace(portStr)
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, errors.NewValidationError(fmt.Sprintf("invalid port: %s", portStr))
+		}
+
+		if port <= 0 || port > 65535 {
+			return nil, errors.NewValidationError(fmt.Sprintf("port out of range: %d", port))
+		}
+
+		ports = append(ports, port)
+	}
+
+	return ports, nil
+}
+
+func parseProtocols(protocolsStr string) []string {
+	if protocolsStr == "" {
+		return []string{"http", "https"}
+	}
+
+	protocolStrs := strings.Split(protocolsStr, ",")
+	protocols := make([]string, 0, len(protocolStrs))
+
+	for _, protocol := range protocolStrs {
+		protocol = strings.TrimSpace(strings.ToLower(protocol))
+		if protocol == "http" || protocol == "https" {
+			protocols = append(protocols, protocol)
+		}
+	}
+
+	if len(protocols) == 0 {
+		return []string{"http", "https"}
+	}
+
+	return protocols
 }
 
 func parseScreenshotOptions() (*screenshot.ScreenshotOptions, error) {
@@ -239,9 +336,8 @@ func parseScreenshotOptions() (*screenshot.ScreenshotOptions, error) {
 		opts.ChromePath = screenshotChromePath
 	}
 
-	opts.AutoDownload = screenshotAutoDownload
 	opts.SkipPortCheck = screenshotSkipPortCheck
-	opts.IgnoreSSLErrors = screenshotIgnoreSSL
+	opts.IgnoreSSLErrors = !screenshotStrict
 
 	// Validate concurrency
 	if opts.Concurrency <= 0 || opts.Concurrency > 50 {
@@ -249,94 +345,4 @@ func parseScreenshotOptions() (*screenshot.ScreenshotOptions, error) {
 	}
 
 	return opts, nil
-}
-
-func parsePorts(portsStr string) ([]int, error) {
-	if portsStr == "" {
-		return []int{80, 443}, nil
-	}
-
-	portStrs := strings.Split(portsStr, ",")
-	ports := make([]int, 0, len(portStrs))
-
-	for _, portStr := range portStrs {
-		portStr = strings.TrimSpace(portStr)
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, errors.NewValidationError(fmt.Sprintf("invalid port: %s", portStr))
-		}
-
-		if port <= 0 || port > 65535 {
-			return nil, errors.NewValidationError(fmt.Sprintf("port out of range: %d", port))
-		}
-
-		ports = append(ports, port)
-	}
-
-	return ports, nil
-}
-
-func parseProtocols(protocolsStr string) []string {
-	if protocolsStr == "" {
-		return []string{"http", "https"}
-	}
-
-	protocolStrs := strings.Split(protocolsStr, ",")
-	protocols := make([]string, 0, len(protocolStrs))
-
-	for _, protocol := range protocolStrs {
-		protocol = strings.TrimSpace(strings.ToLower(protocol))
-		if protocol == "http" || protocol == "https" {
-			protocols = append(protocols, protocol)
-		}
-	}
-
-	if len(protocols) == 0 {
-		return []string{"http", "https"}
-	}
-
-	return protocols
-}
-
-func printScreenshotSummary(results []screenshot.ScreenshotResult, logger *logging.Logger) {
-	var successes, failures int
-	var totalDuration time.Duration
-
-	for _, result := range results {
-		totalDuration += result.Duration
-		if result.Success {
-			successes++
-		} else {
-			failures++
-		}
-	}
-
-	avgDuration := time.Duration(0)
-	if len(results) > 0 {
-		avgDuration = totalDuration / time.Duration(len(results))
-	}
-
-	// Always print concise stdout summary
-	fmt.Printf("Summary: total=%d, successes=%d, failures=%d, total_duration=%s, avg_duration=%s\n",
-		len(results), successes, failures, totalDuration.Round(time.Millisecond), avgDuration.Round(time.Millisecond))
-
-	logger.Info("Screenshot Summary",
-		"total", len(results),
-		"successes", successes,
-		"failures", failures,
-		"total_duration", totalDuration.Round(time.Millisecond),
-		"avg_duration", avgDuration.Round(time.Millisecond))
-
-	// Show first few failures for debugging
-	failureCount := 0
-	for _, result := range results {
-		if !result.Success && failureCount < 5 {
-			logger.Failure("Screenshot failed", "target", result.Target.URL, "error", result.Error)
-			failureCount++
-		}
-	}
-
-	if failures > 5 {
-		logger.Info("Additional failures not shown", "count", failures-5)
-	}
 }

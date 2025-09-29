@@ -7,40 +7,44 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
-func (a *App) displayCertReport(hostPort string, certs []*x509.Certificate) {
-	if _, err := fmt.Fprintf(a.cfg.Out, "[*] Report for %s\n\n", hostPort); err != nil {
-		a.logger.Warn("Failed to write output", "error", err)
+// DisplayCertificateReport displays a formatted certificate report
+func (a *App) DisplayCertificateReport(hostPort string, certificates []*x509.Certificate) error {
+	if _, err := fmt.Fprintf(a.cfg.Out, "[*] Certificate Report for %s\n\n", hostPort); err != nil {
+		return fmt.Errorf("failed to write report header: %w", err)
 	}
-	for i, cert := range certs {
+	
+	for i, cert := range certificates {
 		if _, err := fmt.Fprintf(a.cfg.Out, "[-] Certificate %d:\n", i+1); err != nil {
-			a.logger.Warn("Failed to write output", "error", err)
+			return fmt.Errorf("failed to write certificate entry: %w", err)
 		}
-		if _, err := fmt.Fprintln(a.cfg.Out, "    "+strings.ReplaceAll(certificateSummary(cert), "\n", "\n    ")); err != nil {
-			a.logger.Failure("Failed to write certificate summary", "error", err)
+		summary := certificateSummary(cert)
+		indentedSummary := "    " + strings.ReplaceAll(summary, "\n", "\n    ")
+		if _, err := fmt.Fprintln(a.cfg.Out, indentedSummary); err != nil {
+			return fmt.Errorf("failed to write certificate summary: %w", err)
 		}
 		if _, err := fmt.Fprintln(a.cfg.Out); err != nil {
-			a.logger.Failure("Failed to write newline", "error", err)
+			return fmt.Errorf("failed to write newline: %w", err)
 		}
 	}
+	
+	return nil
 }
 
-func (a *App) recordDNSNames(certs []*x509.Certificate) {
-	for _, c := range certs {
-		for _, d := range c.DNSNames {
-			a.dnsNames[d] = struct{}{}
-		}
-	}
+// RecordDNSNamesFromCertificates records DNS names from certificates
+func (a *App) RecordDNSNamesFromCertificates(certificates []*x509.Certificate) {
+	a.state.AddDNSNames(certificates)
 }
 
 func (a *App) exportCertsSingle(certs []*x509.Certificate, base string) error {
 	for i, c := range certs {
-		name := fmt.Sprintf("%s_cert_%d.pem", base, i+1)
+		ts := time.Now().UTC().Format("20060102_150405")
+		name := fmt.Sprintf("%s_%s_cert_%d.pem", ts, base, i+1)
 		w, err := a.cfg.FileCreator(name)
 		if err != nil {
 			return fmt.Errorf("failed to create certificate file %s: %w", name, err)
@@ -76,16 +80,14 @@ func writeBundle(out io.Writer, certs []*x509.Certificate) error {
 
 func (a *App) finalizeExport(ctx context.Context) error {
 	if a.cfg.ExportMode == "bundle" || a.cfg.ExportMode == "full_bundle" {
-		if err := a.handleFinalExport(ctx, a.cfg.ExportMode, a.allCerts); err != nil {
+		allCerts := a.state.GetAllCertificates()
+		if err := a.handleFinalExport(ctx, a.cfg.ExportMode, allCerts); err != nil {
 			return fmt.Errorf("failed to export certificate bundle: %w", err)
 		}
 	}
 	// Check if DNS export is enabled
-	if a.cfg.DNSExport != nil && a.cfg.DNSExport != (*os.File)(nil) {
-		names := make([]string, 0, len(a.dnsNames))
-		for d := range a.dnsNames {
-			names = append(names, d)
-		}
+	if a.cfg.DNSExport != nil {
+		names := a.state.GetDNSNames()
 		sort.Strings(names)
 		for _, d := range names {
 			if _, err := fmt.Fprintln(a.cfg.DNSExport, d); err != nil {
@@ -107,7 +109,8 @@ func (a *App) handleFinalExport(ctx context.Context, mode string, certs []*x509.
 		}
 	}
 	certs = dedupeCerts(certs)
-	name := "combined_" + mode + ".pem"
+	ts := time.Now().UTC().Format("20060102_150405")
+	name := fmt.Sprintf("%s_combined_%s.pem", ts, mode)
 	w, err := a.cfg.FileCreator(name)
 	if err != nil {
 		return fmt.Errorf("failed to create combined certificate file %s: %w", name, err)

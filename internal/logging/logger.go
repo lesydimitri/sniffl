@@ -1,4 +1,3 @@
-// Package logging provides structured logging for sniffl
 package logging
 
 import (
@@ -19,21 +18,21 @@ func New(level, format string, output io.Writer) *Logger {
 	if output == nil {
 		output = os.Stderr
 	}
-	
+
 	logLevel := parseLevel(level)
-	
+
 	var handler slog.Handler
 	opts := &slog.HandlerOptions{
 		Level: logLevel,
 	}
-	
+
 	switch strings.ToLower(format) {
 	case "json":
 		handler = slog.NewJSONHandler(output, opts)
 	default:
 		handler = slog.NewTextHandler(output, opts)
 	}
-	
+
 	return &Logger{
 		Logger: slog.New(handler),
 		level:  logLevel,

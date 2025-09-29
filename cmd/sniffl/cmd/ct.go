@@ -3,6 +3,8 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/lesydimitri/sniffl/internal/ct"
 	"github.com/lesydimitri/sniffl/internal/errors"
@@ -25,21 +27,21 @@ to include only relevant subdomains.`,
   # Include expired certificates
   sniffl ct github.com --show-expired
 
-  # Export discovered domains
-  sniffl ct example.com --export-dns domains.txt`,
+    # Export discovered domains
+    sniffl ct example.com --export-dns`,
 	Args: cobra.ExactArgs(1),
 	RunE: runCT,
 }
 
 var (
 	ctShowExpired bool
-	ctExportDNS   string
+	ctExportDNS   bool
 	ctDryRun      bool
 )
 
 func init() {
 	ctCmd.Flags().BoolVar(&ctShowExpired, "show-expired", false, "show expired certificates in CT results")
-	ctCmd.Flags().StringVar(&ctExportDNS, "export-dns", "", "file to write discovered DNS names")
+	ctCmd.Flags().BoolVar(&ctExportDNS, "export-dns", false, "export discovered DNS names to EXPORT_DIR/dns with timestamped filename")
 	ctCmd.Flags().BoolVar(&ctDryRun, "dry-run", false, "show what would be done without executing")
 }
 
@@ -57,19 +59,29 @@ func runCT(cmd *cobra.Command, args []string) error {
 
 	// Show dry-run information
 	if ctDryRun {
-		return showCTDryRun(domain, cfg.CTShowExpired, ctExportDNS)
+		showCTDryRun(domain, cfg.CTShowExpired, ctExportDNS)
+		return nil
 	}
 
 	// Setup DNS export file
 	var dnsFile *os.File
-	if ctExportDNS != "" {
-		f, err := os.Create(ctExportDNS)
+	var dnsPath string
+	if ctExportDNS {
+		// Place DNS under EXPORT_DIR/dns with timestamped name using domain
+		dnsDir := filepath.Join(cfg.ExportDir, "dns")
+		if err := os.MkdirAll(dnsDir, cfg.OutputDirPermissions); err != nil {
+			return errors.WrapFileError("cannot create DNS export directory", err)
+		}
+		ts := time.Now().UTC().Format("20060102_150405")
+		safeDomain := filepath.Base(domain)
+		dnsPath = filepath.Join(dnsDir, fmt.Sprintf("%s_%s_dns.txt", ts, safeDomain))
+		f, err := os.OpenFile(dnsPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, cfg.OutputFilePermissions)
 		if err != nil {
 			return errors.WrapFileError("cannot create DNS export file", err)
 		}
 		defer func() {
-			if err := f.Close(); err != nil {
-				logger.Failure("Failed to close DNS export file", "error", err)
+			if closeErr := f.Close(); closeErr != nil {
+				logger.Warn("Failed to close DNS export file", "path", dnsPath, "error", closeErr)
 			}
 		}()
 		dnsFile = f
@@ -119,6 +131,9 @@ func runCT(cmd *cobra.Command, args []string) error {
 
 	// Concise stdout success message
 	fmt.Printf("CT query completed: domain=%s, certificates_found=%d\n", domain, len(entries))
+	if dnsPath != "" {
+		fmt.Printf("[+] Exported DNS names: %s\n", dnsPath)
+	}
 	logger.Success("Certificate Transparency query completed successfully",
 		"domain", domain,
 		"certificates_found", len(entries))
@@ -126,7 +141,7 @@ func runCT(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func showCTDryRun(domain string, showExpired bool, exportDNS string) error {
+func showCTDryRun(domain string, showExpired bool, exportDNS bool) {
 	fmt.Println("=== DRY RUN MODE ===")
 	fmt.Printf("Would query Certificate Transparency logs for domain: %s\n", domain)
 
@@ -136,10 +151,9 @@ func showCTDryRun(domain string, showExpired bool, exportDNS string) error {
 		fmt.Println("Would show only valid certificates (default)")
 	}
 
-	if exportDNS != "" {
-		fmt.Printf("Would export discovered DNS names to: %s\n", exportDNS)
+	if exportDNS {
+		fmt.Println("Would export discovered DNS names to: EXPORT_DIR/dns/<timestamp>_<domain>_dns.txt")
 	}
 
 	fmt.Println("=== END DRY RUN ===")
-	return nil
 }

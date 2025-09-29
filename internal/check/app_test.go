@@ -185,7 +185,7 @@ func TestApp_Run_InvalidHostPort(t *testing.T) {
 
 	// Should report invalid formats in output
 	output := out.String()
-	if !strings.Contains(output, "Invalid host:port") {
+	if !strings.Contains(strings.ToLower(output), "invalid host:port") {
 		t.Error("Output should mention invalid host:port format")
 	}
 }
@@ -498,10 +498,10 @@ func TestApp_Run_ErrorPaths(t *testing.T) {
 	if err != nil {
 		t.Errorf("App.Run should handle invalid targets gracefully, got error: %v", err)
 	}
-	
+
 	// Should report invalid format in output
 	output := out.String()
-	if !strings.Contains(output, "Invalid host:port format") {
+	if !strings.Contains(strings.ToLower(output), "invalid host:port format") {
 		t.Error("Expected output to mention invalid host:port format")
 	}
 

@@ -18,7 +18,7 @@ func TestIsValidHostPort(t *testing.T) {
 		{"valid_ipv4", "127.0.0.1:8080", true},
 		{"valid_ipv6", "[::1]:443", true},
 		{"valid_ipv6_full", "[2001:db8::1]:443", true},
-		
+
 		// Invalid cases
 		{"invalid_port_name", "example.com:port", false},
 		{"missing_host", ":443", false},
@@ -27,10 +27,10 @@ func TestIsValidHostPort(t *testing.T) {
 		{"empty_string", "", false},
 		{"only_colon", ":", false},
 		{"port_too_high", "example.com:99999", true}, // net.SplitHostPort allows this
-		{"port_zero", "example.com:0", true},         // net.SplitHostPort allows this  
-		{"negative_port", "example.com:-1", true}, // strconv.Atoi accepts negative numbers
+		{"port_zero", "example.com:0", true},         // net.SplitHostPort allows this
+		{"negative_port", "example.com:-1", true},    // strconv.Atoi accepts negative numbers
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := IsValidHostPort(tc.hostPort)
@@ -54,19 +54,19 @@ func TestIsValidHostPort_Hardening(t *testing.T) {
 		{"carriage_return", "bad\rhost:443", false},
 		{"line_feed", "bad\nhost:443", false},
 		{"slash_in_host", "bad/host:443", false},
-		
+
 		// Invalid DNS label formats
 		{"label_starts_hyphen", "-bad.example:443", false},
 		{"label_ends_hyphen", "bad-.example:443", false},
 		{"label_too_long", strings.Repeat("a", 64) + ".example:443", false},
 		{"hostname_too_long", strings.Repeat("a", 254) + ":443", false},
-		
+
 		// Valid edge cases
 		{"ipv6_literal", "[::1]:443", true},
 		{"max_valid_port", "example.com:65535", true},
 		{"single_char_host", "a:443", true},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := IsValidHostPort(tc.hostPort)
